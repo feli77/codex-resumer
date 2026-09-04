@@ -505,13 +505,7 @@ async function waitForTaskState(
   paths: ReturnType<typeof resolvePaths>,
   state: string,
 ) {
-  let snapshot = await getQueueStatus(paths);
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (snapshot.tasks[0]?.state === state) return snapshot;
-    await settle();
-    snapshot = await getQueueStatus(paths);
-  }
-  return snapshot;
+  return waitForSnapshot(paths, (snapshot) => snapshot.tasks[0]?.state === state);
 }
 
 async function waitForTurnCount(appServer: FakeAppServer, count: number): Promise<void> {
@@ -525,9 +519,19 @@ async function waitForQuotaLimit(
   paths: ReturnType<typeof resolvePaths>,
   limitId: string,
 ) {
+  return waitForSnapshot(
+    paths,
+    (snapshot) => snapshot.tasks[0]?.quotaLimitId === limitId,
+  );
+}
+
+async function waitForSnapshot(
+  paths: ReturnType<typeof resolvePaths>,
+  matches: (snapshot: Awaited<ReturnType<typeof getQueueStatus>>) => boolean,
+) {
   let snapshot = await getQueueStatus(paths);
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (snapshot.tasks[0]?.quotaLimitId === limitId) return snapshot;
+    if (matches(snapshot)) return snapshot;
     await settle();
     snapshot = await getQueueStatus(paths);
   }
