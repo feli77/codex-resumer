@@ -187,7 +187,9 @@ export class TaskService {
       const rateLimits = await this.appServer.readRateLimits()
         .catch(() => emptyRateLimits());
       if (!quotaIsAvailable(rateLimits, current.limitId)) {
-        const refreshed = quotaForLimit(rateLimits, current.limitId);
+        const refreshed = current.limitId === undefined
+          ? selectApplicableQuota(rateLimits)
+          : quotaForLimit(rateLimits, current.limitId);
         const resetAt = refreshed.resetAt;
         const resetIsAhead = resetAt !== undefined
           && resetAt.getTime() + QUOTA_RESET_SAFETY_MS > this.clock.now().getTime();

@@ -77,7 +77,7 @@ class ManualClock {
 
 class FakeAppServer implements AppServerController {
   readonly quotaPauseOnTurnNumbers = new Set<number>();
-  readonly rateLimitReads: RateLimits[] = [];
+  readonly rateLimitReads: Array<Error | RateLimits> = [];
   readonly resumedThreads: string[] = [];
   readonly turns: Array<{ prompt: string; threadId: string; turnId: string }> = [];
   #completedListeners = new Set<(turn: CompletedTurn) => void>();
@@ -116,6 +116,7 @@ class FakeAppServer implements AppServerController {
   async readRateLimits(): Promise<RateLimits> {
     const next = this.rateLimitReads.shift();
     if (!next) throw new Error("unexpected rate-limit read");
+    if (next instanceof Error) throw next;
     return next;
   }
 
@@ -305,6 +306,44 @@ test("the reached legacy bucket is not hidden by an unrelated multi-bucket view"
   assert.equal(appServer.turns[1]?.threadId, "thread-quota");
 });
 
+test("polling discovers a reached bucket after the initial rate-limit read fails", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  appServer.rateLimitReads.push(
+    new Error("rate limits temporarily unavailable"),
+    {
+      rateLimits: null,
+      rateLimitsByLimitId: {
+        codex: bucket(
+          "codex",
+          "rate_limit_reached",
+          100,
+          epoch("2026-09-04T10:05:00.000Z"),
+        ),
+        other: bucket("other", null, 20, epoch("2026-09-04T18:00:00.000Z")),
+      },
+    },
+    {
+      rateLimits: null,
+      rateLimitsByLimitId: {
+        codex: bucket("codex", null, 10, null),
+        other: bucket("other", null, 25, epoch("2026-09-04T18:00:00.000Z")),
+      },
+    },
+  );
+
+  await addWorkspaceTask(paths, workspace, "Recover after a transient read failure");
+  await startQueueRun(paths);
+  appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
+  await waitForTaskState(paths, "waiting_for_quota");
+
+  clock.advanceTo("2026-09-04T10:01:00.000Z");
+  const identified = await waitForQuotaLimit(paths, "codex");
+  assert.equal(identified.tasks[0]?.quotaResetAt, "2026-09-04T10:05:00.000Z");
+  clock.advanceTo("2026-09-04T10:05:02.000Z");
+  await waitForTurnCount(appServer, 2);
+  assert.equal(appServer.turns[1]?.threadId, "thread-quota");
+});
+
 test("Until Idle recovers from repeated Quota Pauses", async (t) => {
   const { appServer, clock, paths, workspace } = await createEnvironment(t);
   appServer.quotaPauseOnTurnNumbers.add(2);
@@ -480,4 +519,17 @@ async function waitForTurnCount(appServer: FakeAppServer, count: number): Promis
     if (appServer.turns.length === count) return;
     await settle();
   }
+}
+
+async function waitForQuotaLimit(
+  paths: ReturnType<typeof resolvePaths>,
+  limitId: string,
+) {
+  let snapshot = await getQueueStatus(paths);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (snapshot.tasks[0]?.quotaLimitId === limitId) return snapshot;
+    await settle();
+    snapshot = await getQueueStatus(paths);
+  }
+  return snapshot;
 }
