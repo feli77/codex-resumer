@@ -263,22 +263,13 @@ export class CodexAppServer implements AppServerController {
       });
       this.#notify("initialized", {});
 
-      let accountResult: unknown;
       try {
-        accountResult = await this.#request("account/read", {
+        const accountResult = await this.#request("account/read", {
           refreshToken: false,
         });
-      } catch (error) {
-        if (isAuthenticationError(error)) {
+        if (!hasChatGptAccount(accountResult)) {
           return unauthenticated(codexVersion);
         }
-        throw error;
-      }
-      if (!hasChatGptAccount(accountResult)) {
-        return unauthenticated(codexVersion);
-      }
-
-      try {
         await this.#request("account/rateLimits/read");
       } catch (error) {
         if (isAuthenticationError(error)) {
