@@ -27,7 +27,7 @@ export class TaskService {
     };
   }
 
-  addToThread(threadId: string, prompt: string): { taskId: number } {
+  addToManagedThread(threadId: string, prompt: string): { taskId: number } {
     if (prompt.trim().length === 0) throw new Error("Task prompt must not be empty.");
     return {
       taskId: this.store.addManagedThreadTask(threadId, prompt, this.clock.now()),
@@ -45,16 +45,20 @@ export class TaskService {
   }
 
   async start(): Promise<{ state: "started" | "already-running" | "idle" }> {
+    return { state: await this.#startNextTask() };
+  }
+
+  async #startNextTask(): Promise<"started" | "already-running" | "idle"> {
     const next = this.store.startNextTask(this.clock.now());
-    if (next.kind !== "started") return { state: next.kind };
+    if (next.kind !== "started") return next.kind;
     try {
       await accessibleWorkspace(next.task.workspace);
+      await this.dispatch(next.task);
     } catch (error) {
       this.store.releaseTaskBeforeDispatch(next.task.id, this.clock.now());
       throw error;
     }
-    await this.dispatch(next.task);
-    return { state: "started" };
+    return "started";
   }
 
   snapshot(): QueueSnapshot {
@@ -106,13 +110,10 @@ export class TaskService {
   #scheduleAutomaticAdvance(): void {
     this.#automaticAdvance = this.#automaticAdvance
       .then(async () => {
-        const next = this.store.startNextTask(this.clock.now());
-        if (next.kind !== "started") return;
         try {
-          await accessibleWorkspace(next.task.workspace);
-          await this.dispatch(next.task);
+          await this.#startNextTask();
         } catch {
-          this.store.releaseTaskBeforeDispatch(next.task.id, this.clock.now());
+          // The shared start operation pauses the Queue and restores the Task.
         }
       })
       .catch(() => undefined);
@@ -138,7 +139,10 @@ export async function handleTaskRequest(
       }
       return hasWorkspace
         ? taskService.add(request.params.workspace as string, request.params.prompt)
-        : taskService.addToThread(request.params.threadId as string, request.params.prompt);
+        : taskService.addToManagedThread(
+          request.params.threadId as string,
+          request.params.prompt,
+        );
     }
     case "queue/start":
       return taskService.start();
