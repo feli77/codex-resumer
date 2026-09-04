@@ -5,6 +5,7 @@ const APP_DIRECTORY = "codex-resumer";
 
 export interface DaemonPaths {
   configDir: string;
+  configPath: string;
   databasePath: string;
   lockPath: string;
   runtimeDir: string;
@@ -29,6 +30,7 @@ export function resolvePaths(
 
   return {
     configDir: path.join(configBase, APP_DIRECTORY),
+    configPath: path.join(configBase, APP_DIRECTORY, "config.json"),
     databasePath: path.join(stateBase, APP_DIRECTORY, "state.sqlite3"),
     lockPath: path.join(runtimeDir, "daemon-start.lock"),
     runtimeDir,

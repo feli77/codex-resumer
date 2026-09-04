@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 import { CodexAppServer } from "./app-server.js";
+import { readConfiguration, setContinuationPrompt } from "./config.js";
 import {
   addManagedThreadTask,
   addWorkspaceTask,
@@ -28,6 +29,8 @@ const usage = `Usage:
   codex-resumer task move <task-id> (--before|--after) <task-id>
   codex-resumer thread import <thread-id>
   codex-resumer queue <start|status>
+  codex-resumer config show
+  codex-resumer config set continuationPrompt <prompt>
 
 Manage the daemon and a FIFO Queue across Managed Threads and Workspaces.
 `;
@@ -117,6 +120,23 @@ async function main(args: string[]): Promise<number> {
 
   if (args[0] === "queue" && args[1] === "status" && args.length === 2) {
     process.stdout.write(renderQueueStatus(await getQueueStatus(paths)));
+    return 0;
+  }
+
+  if (args[0] === "config" && args[1] === "show" && args.length === 2) {
+    const config = await readConfiguration(paths.configPath);
+    process.stdout.write(`Continuation prompt: ${config.continuationPrompt}\n`);
+    return 0;
+  }
+
+  if (
+    args[0] === "config"
+    && args[1] === "set"
+    && args[2] === "continuationPrompt"
+    && args.length >= 4
+  ) {
+    await setContinuationPrompt(paths, args.slice(3).join(" "));
+    process.stdout.write("Continuation prompt updated.\n");
     return 0;
   }
 
@@ -215,6 +235,13 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
     lines.push(
       `  Thread ${task.managedThreadId ?? "new"}, Turn ${task.activeTurnId ?? "pending"}`,
     );
+    if (task.state === "waiting_for_quota") {
+      lines.push(
+        `  Quota ${task.quotaLimitId ?? "unknown"}`
+        + `${task.quotaLimitType ? ` (${task.quotaLimitType})` : ""}, `
+        + `reset ${task.quotaResetAt ?? "unknown"}`,
+      );
+    }
   }
   return `${lines.join("\n")}\n`;
 }

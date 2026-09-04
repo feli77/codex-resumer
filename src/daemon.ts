@@ -12,20 +12,46 @@ import {
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
 import type { DaemonPaths } from "./paths.js";
+import { readConfiguration } from "./config.js";
 import { StateStore, type QueueSnapshot } from "./state-store.js";
 import { handleTaskRequest, TaskService } from "./task-service.js";
 
 export interface Clock {
   now(): Date;
+  waitUntil?(until: Date, signal: AbortSignal): Promise<void>;
+}
+
+export interface RateLimitWindow {
+  resetsAt: number | null;
+  usedPercent: number;
+}
+
+export interface RateLimitSnapshot {
+  limitId: string | null;
+  primary: RateLimitWindow | null;
+  rateLimitReachedType: string | null;
+  secondary: RateLimitWindow | null;
+}
+
+export interface AccountRateLimits {
+  rateLimits: RateLimitSnapshot | null;
+  rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null;
+}
+
+export interface UsageLimitExceeded {
+  threadId: string;
+  turnId: string;
 }
 
 export interface AppServerController {
   startAndProbe(): Promise<AppServerProbeResult>;
+  readRateLimits(): Promise<AccountRateLimits>;
   readThread(threadId: string): Promise<{ threadId: string; workspace: string }>;
   resumeThread(threadId: string): Promise<{ threadId: string }>;
   startThread(workspace: string): Promise<{ threadId: string }>;
   startTurn(threadId: string, prompt: string): Promise<{ turnId: string }>;
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void;
+  onUsageLimitExceeded(listener: (event: UsageLimitExceeded) => void): () => void;
   close(): Promise<void>;
 }
 
@@ -136,9 +162,17 @@ export async function startDaemon({
       await appServer.close();
       throw error;
     }
-    const taskService = new TaskService(appServer, store, clock);
-    const unsubscribe = appServer.onTurnCompleted((turn) => {
+    const taskService = new TaskService(
+      appServer,
+      store,
+      clock,
+      async () => (await readConfiguration(paths.configPath)).continuationPrompt,
+    );
+    const unsubscribeTurnCompleted = appServer.onTurnCompleted((turn) => {
       taskService.handleTurnCompleted(turn);
+    });
+    const unsubscribeUsageLimit = appServer.onUsageLimitExceeded((event) => {
+      taskService.handleUsageLimitExceeded(event);
     });
     let closing: Promise<void> | undefined;
     const close = (): Promise<void> => {
@@ -148,7 +182,8 @@ export async function startDaemon({
         paths,
         daemonLock,
         store,
-        unsubscribe,
+        taskService,
+        [unsubscribeTurnCompleted, unsubscribeUsageLimit],
       );
       return closing;
     };
@@ -159,7 +194,8 @@ export async function startDaemon({
     try {
       await listen(server, paths.socketPath);
     } catch (error) {
-      unsubscribe?.();
+      unsubscribeTurnCompleted();
+      unsubscribeUsageLimit();
       store.close();
       await appServer.close();
       const runningWinner = await requestRunningStatus(paths);
@@ -446,13 +482,15 @@ async function closeDaemon(
   paths: DaemonPaths,
   daemonLock: StartupLock,
   store: StateStore,
-  unsubscribe: (() => void) | undefined,
+  taskService: TaskService,
+  unsubscribe: Array<() => void>,
 ): Promise<void> {
   try {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
-    unsubscribe?.();
+    for (const stopListening of unsubscribe) stopListening();
+    taskService.close();
     await appServer.close();
     store.close();
     await unlinkIfExists(paths.socketPath);
@@ -532,11 +570,15 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
     && (
       task.state === "queued"
       || task.state === "running"
+      || task.state === "waiting_for_quota"
       || task.state === "completed"
       || task.state === "cancelled"
     )
     && (task.managedThreadId === undefined || typeof task.managedThreadId === "string")
     && (task.activeTurnId === undefined || typeof task.activeTurnId === "string")
+    && (task.quotaLimitId === undefined || typeof task.quotaLimitId === "string")
+    && (task.quotaLimitType === undefined || typeof task.quotaLimitType === "string")
+    && (task.quotaResetAt === undefined || typeof task.quotaResetAt === "string")
   );
 }
 

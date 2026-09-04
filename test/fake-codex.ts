@@ -9,6 +9,7 @@ interface FakeCodexOptions {
   omitClientRequest?: string;
   omitRateLimitResetTime?: boolean;
   turnCompletionDelayMs?: number;
+  turnErrors?: Array<{ codexErrorInfo: string; message: string }>;
 }
 
 export async function createFakeCodex(
@@ -225,6 +226,7 @@ const lines = readline.createInterface({ input: process.stdin });
 const threads = new Map();
 let startedThreadCount = 0;
 let turnCount = 0;
+const turnErrors = ${JSON.stringify(options.turnErrors ?? [])};
 lines.on("line", (line) => {
   const message = JSON.parse(line);
   log({ type: "message", message });
@@ -298,7 +300,20 @@ lines.on("line", (line) => {
     const turnId = turnCount === 1 ? "turn-fake" : "turn-fake-" + turnCount;
     const turn = { id: turnId, status: "inProgress", items: [] };
     const response = JSON.stringify({ id: message.id, result: { turn } });
-    if (${String(options.completeTurn !== false)}) {
+    const turnError = turnErrors[turnCount - 1];
+    if (turnError) {
+      const error = JSON.stringify({ method: "error", params: {
+        error: turnError,
+        threadId: message.params.threadId,
+        turnId,
+        willRetry: false,
+      } });
+      const failed = JSON.stringify({ method: "turn/completed", params: {
+        threadId: message.params.threadId,
+        turn: { ...turn, status: "failed", error: turnError },
+      } });
+      process.stdout.write(response + "\\n" + error + "\\n" + failed + "\\n");
+    } else if (${String(options.completeTurn !== false)}) {
       const completed = JSON.stringify({ method: "turn/completed", params: {
         threadId: message.params.threadId,
         turn: { ...turn, status: "completed" },

@@ -6,9 +6,12 @@ import readline, { type Interface as ReadLineInterface } from "node:readline";
 import { promisify } from "node:util";
 
 import type {
+  AccountRateLimits,
   AppServerController,
   AppServerProbeResult,
   CompletedTurn,
+  RateLimitSnapshot,
+  UsageLimitExceeded,
 } from "./daemon.js";
 
 const execFileAsync = promisify(execFile);
@@ -217,6 +220,7 @@ export class CodexAppServer implements AppServerController {
   #nextRequestId = 0;
   #pending = new Map<number, PendingRequest>();
   #turnCompletedListeners = new Set<(turn: CompletedTurn) => void>();
+  #usageLimitListeners = new Set<(event: UsageLimitExceeded) => void>();
   #closePromise: Promise<void> | undefined;
 
   constructor(options: CodexAppServerOptions = {}) {
@@ -345,6 +349,10 @@ export class CodexAppServer implements AppServerController {
     return { threadId };
   }
 
+  async readRateLimits(): Promise<AccountRateLimits> {
+    return parseAccountRateLimits(await this.#request("account/rateLimits/read"));
+  }
+
   async startTurn(threadId: string, prompt: string): Promise<{ turnId: string }> {
     const result = await this.#request("turn/start", {
       threadId,
@@ -359,6 +367,11 @@ export class CodexAppServer implements AppServerController {
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void {
     this.#turnCompletedListeners.add(listener);
     return () => this.#turnCompletedListeners.delete(listener);
+  }
+
+  onUsageLimitExceeded(listener: (event: UsageLimitExceeded) => void): () => void {
+    this.#usageLimitListeners.add(listener);
+    return () => this.#usageLimitListeners.delete(listener);
   }
 
   async #readVersion(): Promise<string> {
@@ -464,6 +477,13 @@ export class CodexAppServer implements AppServerController {
       return;
     }
     if (!isRecord(message)) return;
+    if (message.method === "error") {
+      const usageLimit = parseUsageLimitExceeded(message.params);
+      if (usageLimit) {
+        for (const listener of this.#usageLimitListeners) listener(usageLimit);
+      }
+      return;
+    }
     if (message.method === "turn/completed") {
       const completed = parseCompletedTurn(message.params);
       if (completed) {
@@ -499,6 +519,66 @@ export class CodexAppServer implements AppServerController {
     }
     this.#pending.clear();
   }
+}
+
+function parseUsageLimitExceeded(value: unknown): UsageLimitExceeded | undefined {
+  if (
+    !isRecord(value)
+    || typeof value.threadId !== "string"
+    || typeof value.turnId !== "string"
+    || !isRecord(value.error)
+    || value.error.codexErrorInfo !== "usageLimitExceeded"
+  ) {
+    return undefined;
+  }
+  return { threadId: value.threadId, turnId: value.turnId };
+}
+
+function parseAccountRateLimits(value: unknown): AccountRateLimits {
+  if (!isRecord(value)) {
+    throw new Error("Codex App Server returned invalid rate limits");
+  }
+  const rateLimits = value.rateLimits === null
+    ? null
+    : parseRateLimitSnapshot(value.rateLimits);
+  let rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null = null;
+  if (value.rateLimitsByLimitId !== null && value.rateLimitsByLimitId !== undefined) {
+    if (!isRecord(value.rateLimitsByLimitId)) {
+      throw new Error("Codex App Server returned invalid rate limits");
+    }
+    rateLimitsByLimitId = {};
+    for (const [limitId, snapshot] of Object.entries(value.rateLimitsByLimitId)) {
+      rateLimitsByLimitId[limitId] = parseRateLimitSnapshot(snapshot);
+    }
+  }
+  return { rateLimits, rateLimitsByLimitId };
+}
+
+function parseRateLimitSnapshot(value: unknown): RateLimitSnapshot {
+  if (!isRecord(value)) {
+    throw new Error("Codex App Server returned invalid rate limits");
+  }
+  return {
+    limitId: typeof value.limitId === "string" ? value.limitId : null,
+    primary: parseRateLimitWindow(value.primary),
+    rateLimitReachedType: typeof value.rateLimitReachedType === "string"
+      ? value.rateLimitReachedType
+      : null,
+    secondary: parseRateLimitWindow(value.secondary),
+  };
+}
+
+function parseRateLimitWindow(
+  value: unknown,
+): RateLimitSnapshot["primary"] {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value) || typeof value.usedPercent !== "number") {
+    throw new Error("Codex App Server returned invalid rate limits");
+  }
+  return {
+    resetsAt: typeof value.resetsAt === "number" ? value.resetsAt : null,
+    usedPercent: value.usedPercent,
+  };
 }
 
 function parseCompletedTurn(value: unknown): CompletedTurn | undefined {

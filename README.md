@@ -49,6 +49,19 @@ codex-resumer queue start
 codex-resumer queue status
 ```
 
+Inspect or replace the global Continuation prompt:
+
+```sh
+codex-resumer config show
+codex-resumer config set continuationPrompt \
+  "Inspect the current work, finish what remains, and do not repeat completed work."
+```
+
+The default is:
+
+> Inspect the current Thread and Workspace state, continue the unfinished Task,
+> and do not repeat work that is already complete.
+
 Import an existing Thread, add a Task to it, or supply a multiline prompt on
 stdin:
 
@@ -82,6 +95,16 @@ model output. Every Workspace target creates a new Thread. Imported Threads are
 validated with App Server and permanently bound to their recorded Workspace.
 New Threads and Turns omit model, reasoning, and personality overrides, so Codex
 uses the user's current defaults.
+
+When App Server reports a structured `usageLimitExceeded` error, the active Task
+enters `waiting_for_quota` while retaining its Managed Thread and failed Turn.
+Codex Resumer selects the reached rate-limit bucket, waits until its server-provided
+reset time plus a two-second safety margin, and reads the limits again before it
+continues. If no reset time is available, it polls with exponential delays from one
+minute up to a fifteen-minute cap. A recovered Task starts a new Turn in the same
+Managed Thread with the current global Continuation prompt; the original Task prompt
+is never submitted again. Repeated Quota Pauses follow the same process until the
+Task completes or the Queue is paused.
 
 `daemon start` detaches from the terminal. Starting it again is safe and keeps a
 single daemon instance. At startup, Codex Resumer checks the installed protocol
