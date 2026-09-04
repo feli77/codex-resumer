@@ -2,7 +2,15 @@ import { chmodSync } from "node:fs";
 
 import Database from "better-sqlite3";
 
+import type { RunPolicy } from "./run-policy.js";
+
 export type QueueState = "paused" | "running" | "idle";
+export type PauseReason =
+  | "cutoff_reached"
+  | "manual"
+  | "needs_attention"
+  | "not_started"
+  | "run_policy_required";
 export type TaskState =
   | "queued"
   | "running"
@@ -42,9 +50,29 @@ export interface QuotaPause extends QuotaPauseDetails {
 }
 
 export interface QueueSnapshot {
+  pauseReason?: PauseReason;
+  queueRun?: {
+    cutoffTime?: string;
+    endedAt?: string;
+    id: number;
+    runPolicy: RunPolicy["kind"];
+    startedAt: string;
+  };
   state: QueueState;
   tasks: TaskSummary[];
 }
+
+interface QueueRunRow {
+  cutoff_time: string | null;
+  ended_at: string | null;
+  id: number;
+  run_policy: RunPolicy["kind"];
+  started_at: string;
+}
+
+type PersistedQueueRunState =
+  | { kind: "idle" | "paused" }
+  | { kind: "running"; queueRun: QueueRunRow };
 
 interface TaskRow {
   active_turn_id: string | null;
@@ -121,6 +149,18 @@ export class StateStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS queue_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_policy TEXT NOT NULL CHECK (run_policy IN ('until_idle', 'cutoff_time')),
+        cutoff_time TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        CHECK (
+          (run_policy = 'until_idle' AND cutoff_time IS NULL)
+          OR (run_policy = 'cutoff_time' AND cutoff_time IS NOT NULL)
+        )
+      );
+
       ${createTasksTable(true)}
       ${createActiveTaskIndex(true)}
 
@@ -136,10 +176,55 @@ export class StateStore {
     `);
     this.#migrateTaskQueue();
     this.#migrateQuotaPause();
+    this.#migrateQueuePauseReason();
     this.#database.prepare(`
-      INSERT OR IGNORE INTO queue (id, state, updated_at)
-      VALUES (1, 'paused', ?)
+      INSERT OR IGNORE INTO queue (id, state, pause_reason, updated_at)
+      VALUES (1, 'paused', 'not_started', ?)
     `).run(new Date().toISOString());
+  }
+
+  startQueueRun(
+    runPolicy: RunPolicy,
+    now: Date,
+  ): "started" | "already-running" {
+    return this.#database.transaction(() => {
+      if (this.#queueRunState(now).kind === "running") {
+        return "already-running" as const;
+      }
+      if (
+        runPolicy.kind === "cutoff_time"
+        && new Date(runPolicy.cutoffTime).getTime() <= now.getTime()
+      ) {
+        throw new Error("Cutoff Time must be in the future.");
+      }
+
+      this.#database.prepare(`
+        INSERT INTO queue_runs (run_policy, cutoff_time, started_at)
+        VALUES (?, ?, ?)
+      `).run(
+        runPolicy.kind,
+        runPolicy.kind === "cutoff_time" ? runPolicy.cutoffTime : null,
+        now.toISOString(),
+      );
+      this.#database.prepare(`
+        UPDATE queue SET state = 'running', pause_reason = NULL, updated_at = ?
+        WHERE id = 1
+      `).run(now.toISOString());
+      return "started" as const;
+    })();
+  }
+
+  restoreQueueRun(now: Date): RunPolicy | undefined {
+    return this.#database.transaction((): RunPolicy | undefined => {
+      const state = this.#queueRunState(now);
+      if (state.kind !== "running") return undefined;
+      const activeRun = state.queueRun;
+      if (activeRun.cutoff_time === null) return { kind: "until_idle" };
+      return {
+        cutoffTime: activeRun.cutoff_time,
+        kind: "cutoff_time",
+      };
+    })();
   }
 
   addWorkspaceTask(workspace: string, prompt: string, now: Date): number {
@@ -188,21 +273,23 @@ export class StateStore {
   startNextTask(now: Date):
     | { kind: "started"; task: QueuedTask }
     | { kind: "already-running" }
-    | { kind: "idle" } {
+    | { kind: "idle" | "paused" } {
     return this.#database.transaction(() => {
+      const state = this.#queueRunState(now);
+      if (state.kind !== "running") return { kind: state.kind };
       const running = this.#database.prepare(
         "SELECT id FROM tasks WHERE state IN ('running', 'waiting_for_quota')",
       ).get();
       if (running) return { kind: "already-running" } as const;
 
-      this.#database.prepare(`
-        UPDATE queue SET state = 'running', updated_at = ? WHERE id = 1
-      `).run(now.toISOString());
       const task = this.#database.prepare(`
         SELECT id, workspace, prompt, managed_thread_id AS managedThreadId FROM tasks
         WHERE state = 'queued' ORDER BY queue_position, id LIMIT 1
       `).get() as QueuedTask | undefined;
-      if (!task) return { kind: "idle" } as const;
+      if (!task) {
+        this.#endActiveQueueRun(now);
+        return { kind: "idle" } as const;
+      }
 
       this.#database.prepare(`
         UPDATE tasks SET state = 'running', started_at = ? WHERE id = ?
@@ -218,8 +305,10 @@ export class StateStore {
         WHERE id = ? AND state = 'running'
       `).run(taskId);
       this.#database.prepare(`
-        UPDATE queue SET state = 'paused', updated_at = ? WHERE id = 1
+        UPDATE queue SET state = 'paused', pause_reason = 'needs_attention', updated_at = ?
+        WHERE id = 1
       `).run(now.toISOString());
+      this.#endActiveQueueRun(now);
     })();
   }
 
@@ -390,6 +479,13 @@ export class StateStore {
     };
   }
 
+  readWaitingQuotaPause(): QuotaPause | undefined {
+    const task = this.#database.prepare(`
+      SELECT id FROM tasks WHERE state = 'waiting_for_quota' LIMIT 1
+    `).get() as { id: number } | undefined;
+    return task ? this.readQuotaPause(task.id) : undefined;
+  }
+
   updateQuotaPause(
     taskId: number,
     quota: QuotaPauseDetails & { pollAttempt: number },
@@ -410,9 +506,56 @@ export class StateStore {
   }
 
   isQueueRunning(): boolean {
-    return this.#database.prepare(
-      "SELECT 1 FROM queue WHERE id = 1 AND state = 'running'",
-    ).get() !== undefined;
+    const queue = this.#database.prepare(
+      "SELECT state FROM queue WHERE id = 1",
+    ).get() as { state: "paused" | "running" };
+    return queue.state === "running" && this.#latestQueueRun()?.ended_at === null;
+  }
+
+  pauseAtCutoff(cutoffTime: string, now: Date): boolean {
+    return this.#database.transaction(() => {
+      const activeRun = this.#latestQueueRun();
+      if (
+        !activeRun
+        || activeRun.ended_at !== null
+        || activeRun.cutoff_time !== cutoffTime
+        || new Date(cutoffTime).getTime() > now.getTime()
+      ) return false;
+      this.#pauseQueue("cutoff_reached", now);
+      return true;
+    })();
+  }
+
+  pause(now: Date): void {
+    this.#database.transaction(() => {
+      const queue = this.#database.prepare(
+        "SELECT state FROM queue WHERE id = 1",
+      ).get() as { state: "paused" | "running" };
+      if (queue.state === "paused") return;
+      this.#pauseQueue("manual", now);
+    })();
+  }
+
+  canStartTurn(now: Date): boolean {
+    return this.#database.transaction(() => {
+      return this.#queueRunState(now).kind === "running";
+    })();
+  }
+
+  releaseUndispatchedTask(taskId: number): void {
+    this.#database.transaction(() => {
+      this.#database.prepare(`
+        UPDATE managed_threads SET state = 'idle'
+        WHERE id = (
+          SELECT managed_thread_id FROM tasks
+          WHERE id = ? AND state = 'running' AND active_turn_id IS NULL
+        )
+      `).run(taskId);
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'queued', started_at = NULL
+        WHERE id = ? AND state = 'running' AND active_turn_id IS NULL
+      `).run(taskId);
+    })();
   }
 
   recordContinuationTurnStarted(
@@ -470,8 +613,9 @@ export class StateStore {
 
   snapshot(): QueueSnapshot {
     const queue = this.#database.prepare(
-      "SELECT state FROM queue WHERE id = 1",
-    ).get() as { state: "paused" | "running" };
+      "SELECT state, pause_reason FROM queue WHERE id = 1",
+    ).get() as { pause_reason: PauseReason | null; state: "paused" | "running" };
+    const queueRun = this.#latestQueueRun();
     const tasks = this.#database.prepare(`
       SELECT id, workspace, state, managed_thread_id, active_turn_id, prompt,
              quota_limit_id, quota_limit_type, quota_reset_at
@@ -484,7 +628,24 @@ export class StateStore {
         || task.state === "waiting_for_quota",
     );
     return {
-      state: queue.state === "running" && !hasUnfinishedTask ? "idle" : queue.state,
+      state: queue.state === "running"
+          && (queueRun?.ended_at !== null || !hasUnfinishedTask)
+        ? "idle"
+        : queue.state,
+      ...(queue.pause_reason === null ? {} : { pauseReason: queue.pause_reason }),
+      ...(queueRun
+        ? {
+          queueRun: {
+            id: queueRun.id,
+            runPolicy: queueRun.run_policy,
+            startedAt: queueRun.started_at,
+            ...(queueRun.cutoff_time === null
+              ? {}
+              : { cutoffTime: queueRun.cutoff_time }),
+            ...(queueRun.ended_at === null ? {} : { endedAt: queueRun.ended_at }),
+          },
+        }
+        : {}),
       tasks: tasks.map((task) => ({
         id: task.id,
         workspace: task.workspace,
@@ -588,5 +749,59 @@ export class StateStore {
     }
     const violations = this.#database.pragma("foreign_key_check") as unknown[];
     if (violations.length > 0) throw new Error("Quota Pause migration failed.");
+  }
+
+  #migrateQueuePauseReason(): void {
+    const columns = this.#database.pragma("table_info(queue)") as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "pause_reason")) return;
+    this.#database.exec("ALTER TABLE queue ADD COLUMN pause_reason TEXT");
+    this.#database.prepare(`
+      UPDATE queue SET pause_reason = 'not_started' WHERE state = 'paused'
+    `).run();
+    this.#database.prepare(`
+      UPDATE queue
+      SET state = 'paused', pause_reason = 'run_policy_required'
+      WHERE state = 'running'
+    `).run();
+  }
+
+  #latestQueueRun(): QueueRunRow | undefined {
+    return this.#database.prepare(`
+      SELECT id, run_policy, cutoff_time, started_at, ended_at
+      FROM queue_runs ORDER BY id DESC LIMIT 1
+    `).get() as QueueRunRow | undefined;
+  }
+
+  #queueRunState(now: Date): PersistedQueueRunState {
+    const queue = this.#database.prepare(
+      "SELECT state FROM queue WHERE id = 1",
+    ).get() as { state: "paused" | "running" };
+    if (queue.state === "paused") return { kind: "paused" };
+    const activeRun = this.#latestQueueRun();
+    if (!activeRun || activeRun.ended_at !== null) return { kind: "idle" };
+    if (
+      activeRun.cutoff_time !== null
+      && new Date(activeRun.cutoff_time).getTime() <= now.getTime()
+    ) {
+      this.#pauseQueue("cutoff_reached", now);
+      return { kind: "paused" };
+    }
+    return { kind: "running", queueRun: activeRun };
+  }
+
+  #endActiveQueueRun(now: Date): void {
+    this.#database.prepare(`
+      UPDATE queue_runs SET ended_at = ?
+      WHERE id = (SELECT id FROM queue_runs ORDER BY id DESC LIMIT 1)
+        AND ended_at IS NULL
+    `).run(now.toISOString());
+  }
+
+  #pauseQueue(reason: PauseReason, now: Date): void {
+    this.#database.prepare(`
+      UPDATE queue SET state = 'paused', pause_reason = ?, updated_at = ?
+      WHERE id = 1
+    `).run(reason, now.toISOString());
+    this.#endActiveQueueRun(now);
   }
 }

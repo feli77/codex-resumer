@@ -3,6 +3,7 @@ import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { DEFAULT_CONTINUATION_PROMPT } from "./config.js";
+import { normalizeCutoffTime, type RunPolicy } from "./run-policy.js";
 import type {
   AccountRateLimits,
   AppServerController,
@@ -67,16 +68,46 @@ export class TaskService {
     return { threadId: thread.threadId, workspace };
   }
 
-  async start(): Promise<{ state: "started" | "already-running" | "idle" }> {
-    return { state: await this.#startNextTask() };
+  async start(
+    runPolicy: RunPolicy,
+  ): Promise<{ state: "started" | "already-running" | "idle" | "paused" }> {
+    const result = this.store.startQueueRun(runPolicy, this.clock.now());
+    if (result === "already-running") return { state: result };
+    const next = await this.#continueQueueRun(runPolicy);
+    return { state: next === "already-running" ? "started" : next };
   }
 
-  async #startNextTask(): Promise<"started" | "already-running" | "idle"> {
+  async restoreQueueRun(): Promise<void> {
+    const runPolicy = this.store.restoreQueueRun(this.clock.now());
+    if (!runPolicy) return;
+    await this.#continueQueueRun(runPolicy).catch(() => undefined);
+  }
+
+  async #continueQueueRun(
+    runPolicy: RunPolicy,
+  ): Promise<"started" | "already-running" | "idle" | "paused"> {
+    this.#scheduleCutoff(runPolicy);
+    const quotaPause = this.store.readWaitingQuotaPause();
+    if (quotaPause) {
+      this.#scheduleQuotaRecovery(quotaPause);
+      return "already-running";
+    }
+    return this.#startNextTask();
+  }
+
+  pause(): { state: "paused" } {
+    this.store.pause(this.clock.now());
+    return { state: "paused" };
+  }
+
+  async #startNextTask(): Promise<
+    "started" | "already-running" | "idle" | "paused"
+  > {
     const next = this.store.startNextTask(this.clock.now());
     if (next.kind !== "started") return next.kind;
     try {
       await accessibleWorkspace(next.task.workspace);
-      await this.dispatch(next.task);
+      if (!await this.dispatch(next.task)) return "paused";
     } catch (error) {
       this.store.releaseTaskBeforeDispatch(next.task.id, this.clock.now());
       throw error;
@@ -119,7 +150,7 @@ export class TaskService {
     this.#scheduleQuotaPause(event);
   }
 
-  async dispatch(task: QueuedTask): Promise<void> {
+  async dispatch(task: QueuedTask): Promise<boolean> {
     const { threadId } = task.managedThreadId
       ? await this.appServer.resumeThread(task.managedThreadId)
       : await this.appServer.startThread(task.workspace);
@@ -128,9 +159,14 @@ export class TaskService {
     } else {
       this.store.recordManagedThread(task, threadId, this.clock.now());
     }
+    if (!this.store.canStartTurn(this.clock.now())) {
+      this.store.releaseUndispatchedTask(task.id);
+      return false;
+    }
     const { turnId } = await this.appServer.startTurn(threadId, task.prompt);
     this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
     this.#reconcileTurnStart(threadId, turnId);
+    return true;
   }
 
   #reconcileTurnStart(threadId: string, turnId: string): void {
@@ -210,9 +246,11 @@ export class TaskService {
   async #startContinuation(current: QuotaPause): Promise<void> {
     const { threadId } = await this.appServer.resumeThread(current.threadId);
     this.store.activateManagedThread(threadId);
+    const prompt = await this.continuationPrompt();
+    if (!this.store.canStartTurn(this.clock.now())) return;
     const { turnId } = await this.appServer.startTurn(
       threadId,
-      await this.continuationPrompt(),
+      prompt,
     );
     if (!this.store.recordContinuationTurnStarted(
       current.taskId,
@@ -233,6 +271,17 @@ export class TaskService {
         }
       })
       .catch(() => undefined);
+  }
+
+  #scheduleCutoff(runPolicy: RunPolicy): void {
+    if (runPolicy.kind !== "cutoff_time") return;
+    void waitUntil(
+      this.clock,
+      new Date(runPolicy.cutoffTime),
+      this.#stopping.signal,
+    ).then(() => {
+      this.store.pauseAtCutoff(runPolicy.cutoffTime, this.clock.now());
+    }).catch(() => undefined);
   }
 }
 
@@ -403,8 +452,16 @@ export async function handleTaskRequest(
           request.params.prompt,
         );
     }
-    case "queue/start":
-      return taskService.start();
+    case "queue/start": {
+      const runPolicy = parseRunPolicy(request.params, "queue/start");
+      return taskService.start(runPolicy);
+    }
+    case "queue/resume": {
+      const runPolicy = parseRunPolicy(request.params, "queue/resume");
+      return taskService.start(runPolicy);
+    }
+    case "queue/pause":
+      return taskService.pause();
     case "queue/status":
       return taskService.snapshot();
     case "task/move": {
@@ -461,4 +518,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isTaskId(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function parseRunPolicy(value: unknown, method: string): RunPolicy {
+  if (!isRecord(value) || !isRecord(value.runPolicy)) {
+    throw new Error(`${method} requires a Run Policy.`);
+  }
+  const runPolicy = value.runPolicy;
+  if (runPolicy.kind === "until_idle") return { kind: "until_idle" };
+  if (
+    runPolicy.kind === "cutoff_time"
+    && typeof runPolicy.cutoffTime === "string"
+  ) {
+    try {
+      return {
+        cutoffTime: normalizeCutoffTime(runPolicy.cutoffTime),
+        kind: "cutoff_time",
+      };
+    } catch {
+      // Report the daemon method consistently below.
+    }
+  }
+  throw new Error(`${method} received an invalid Run Policy.`);
 }

@@ -13,6 +13,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 
 import type { DaemonPaths } from "./paths.js";
 import { readConfiguration } from "./config.js";
+import type { RunPolicy } from "./run-policy.js";
 import { StateStore, type QueueSnapshot } from "./state-store.js";
 import { handleTaskRequest, TaskService } from "./task-service.js";
 
@@ -174,6 +175,7 @@ export async function startDaemon({
     const unsubscribeUsageLimit = appServer.onUsageLimitExceeded((event) => {
       taskService.handleUsageLimitExceeded(event);
     });
+    await taskService.restoreQueueRun();
     let closing: Promise<void> | undefined;
     const close = (): Promise<void> => {
       closing ??= closeDaemon(
@@ -288,15 +290,45 @@ export async function cancelTask(paths: DaemonPaths, taskId: number): Promise<vo
 
 export async function startQueueRun(
   paths: DaemonPaths,
-): Promise<"started" | "already-running" | "idle"> {
-  const result = await requestResult(paths.socketPath, { method: "queue/start" });
+  runPolicy: RunPolicy,
+): Promise<QueueRunStartState> {
+  return beginQueueRun(paths, "queue/start", runPolicy);
+}
+
+export async function resumeQueueRun(
+  paths: DaemonPaths,
+  runPolicy: RunPolicy,
+): Promise<QueueRunStartState> {
+  return beginQueueRun(paths, "queue/resume", runPolicy);
+}
+
+async function beginQueueRun(
+  paths: DaemonPaths,
+  method: "queue/resume" | "queue/start",
+  runPolicy: RunPolicy,
+): Promise<QueueRunStartState> {
+  const result = await requestResult(paths.socketPath, { method, params: { runPolicy } });
   if (
     !isRecord(result)
-    || (result.state !== "started" && result.state !== "already-running" && result.state !== "idle")
+    || (
+      result.state !== "started"
+      && result.state !== "already-running"
+      && result.state !== "idle"
+      && result.state !== "paused"
+    )
   ) {
     throw new Error("daemon returned an invalid Queue start result");
   }
   return result.state;
+}
+
+type QueueRunStartState = "started" | "already-running" | "idle" | "paused";
+
+export async function pauseQueue(paths: DaemonPaths): Promise<void> {
+  const result = await requestResult(paths.socketPath, { method: "queue/pause" });
+  if (!isRecord(result) || result.state !== "paused") {
+    throw new Error("daemon returned an invalid Queue pause result");
+  }
 }
 
 export async function getQueueStatus(paths: DaemonPaths): Promise<QueueSnapshot> {
@@ -563,6 +595,15 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
   if (value.state !== "paused" && value.state !== "running" && value.state !== "idle") {
     return false;
   }
+  if (
+    value.pauseReason !== undefined
+    && value.pauseReason !== "not_started"
+    && value.pauseReason !== "manual"
+    && value.pauseReason !== "cutoff_reached"
+    && value.pauseReason !== "needs_attention"
+    && value.pauseReason !== "run_policy_required"
+  ) return false;
+  if (value.queueRun !== undefined && !isQueueRunSummary(value.queueRun)) return false;
   return value.tasks.every((task) =>
     isRecord(task)
     && typeof task.id === "number"
@@ -580,6 +621,15 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
     && (task.quotaLimitType === undefined || typeof task.quotaLimitType === "string")
     && (task.quotaResetAt === undefined || typeof task.quotaResetAt === "string")
   );
+}
+
+function isQueueRunSummary(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.id === "number"
+    && (value.runPolicy === "until_idle" || value.runPolicy === "cutoff_time")
+    && typeof value.startedAt === "string"
+    && (value.cutoffTime === undefined || typeof value.cutoffTime === "string")
+    && (value.endedAt === undefined || typeof value.endedAt === "string");
 }
 
 function errorMessage(error: unknown): string {

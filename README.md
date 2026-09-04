@@ -45,9 +45,27 @@ Add Tasks for new Threads in a Workspace, start the Queue, and inspect its state
 
 ```sh
 codex-resumer task add --workspace ./my-workspace "Implement the requested change"
-codex-resumer queue start
+codex-resumer queue start --until-idle
 codex-resumer queue status
 ```
+
+Every Queue start or resume selects a Run Policy. Use `--until-idle` to keep
+starting Tasks and Continuations until the Queue is empty, or provide a one-time
+absolute Cutoff Time with an explicit timezone:
+
+```sh
+codex-resumer queue start --cutoff 2026-09-05T02:00:00+08:00
+codex-resumer queue pause
+codex-resumer queue resume --until-idle
+```
+
+Manual pause lets an active Turn finish but prevents the next Task or
+Continuation from starting. Resume creates a new Queue Run and requires a new
+Run Policy selection. At Cutoff Time, the Queue is paused without interrupting
+an active Turn. A Cutoff that expires during a Quota Pause prevents the
+Continuation, and an expired Cutoff remains enforced after daemon restart.
+`queue status` shows the persisted Queue Run ID, Run Policy, normalized Cutoff
+Time, start/end times, and pause reason.
 
 Inspect or replace the global Continuation prompt:
 
@@ -104,7 +122,7 @@ continues. If no reset time is available, it polls with exponential delays from 
 minute up to a fifteen-minute cap. A recovered Task starts a new Turn in the same
 Managed Thread with the current global Continuation prompt; the original Task prompt
 is never submitted again. Repeated Quota Pauses follow the same process until the
-Task completes or the Queue is paused.
+Task completes, the Queue is manually paused, or its Cutoff Time is reached.
 
 `daemon start` detaches from the terminal. Starting it again is safe and keeps a
 single daemon instance. At startup, Codex Resumer checks the installed protocol

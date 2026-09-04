@@ -80,7 +80,7 @@ test("a Workspace Task runs once and completes without an output marker", async 
     await runCli("task", "add", "--workspace", "workspace", "Create a note"),
     "Task 1 added.\n",
   );
-  assert.equal(await runCli("queue", "start"), "Queue started.\n");
+  assert.equal(await runCli("queue", "start", "--until-idle"), "Queue started.\n");
 
   let status = "";
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -89,6 +89,7 @@ test("a Workspace Task runs once and completes without an output marker", async 
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.match(status, /Queue is idle/);
+  assert.match(status, /Queue Run 1: Until Idle/);
   assert.match(status, /Task 1: completed/);
   assert.match(status, /Thread thread-fake, Turn turn-fake/);
   assert.doesNotMatch(status, /Create a note/);
@@ -204,7 +205,7 @@ test("a Task targeting a Managed Thread resumes that Thread", async (t) => {
     await runCli("task", "add", "--thread", "thread-imported", "Continue work"),
     "Task 1 added.\n",
   );
-  assert.equal(await runCli("queue", "start"), "Queue started.\n");
+  assert.equal(await runCli("queue", "start", "--until-idle"), "Queue started.\n");
 
   const status = await runCli("queue", "status");
   assert.match(status, /Task 1: completed/);
@@ -234,7 +235,7 @@ test("task add accepts a multiline prompt from stdin", async (t) => {
     ),
     "Task 1 added.\n",
   );
-  await runCli("queue", "start");
+  await runCli("queue", "start", "--until-idle");
 
   const turnStart = (await readFakeMessages(fakeCodex.logPath)).find(
     (message) => message.method === "turn/start",
@@ -274,7 +275,7 @@ test("Tasks run FIFO across Managed Threads and new Workspace Threads", async (t
   await runCli("task", "add", "--workspace", workspace, "First");
   await runCli("task", "add", "--thread", "thread-imported", "Second");
   await runCli("task", "add", "--workspace", workspace, "Third");
-  assert.equal(await runCli("queue", "start"), "Queue started.\n");
+  assert.equal(await runCli("queue", "start", "--until-idle"), "Queue started.\n");
 
   const status = await waitForQueueStatus(runCli, "Task 3: completed");
   assert.match(status, /Task 1: completed[\s\S]*Task 2: completed[\s\S]*Task 3: completed/);
@@ -305,7 +306,7 @@ test("queued Tasks can be added, moved, and cancelled while a Task is active", a
   await runCli("daemon", "start");
   await runCli("task", "add", "--workspace", workspace, "Active secret");
   await runCli("task", "add", "--workspace", workspace, "Second secret");
-  await runCli("queue", "start");
+  await runCli("queue", "start", "--until-idle");
   await runCli("task", "add", "--workspace", workspace, "Cancel secret");
   await runCli("task", "add", "--workspace", workspace, "Move secret");
   assert.equal(await runCli("task", "move", "4", "--before", "2"), "Task 4 moved.\n");
@@ -350,7 +351,7 @@ test("a queued Task cannot move before the active Task", async (t) => {
   await runCli("daemon", "start");
   await runCli("task", "add", "--workspace", workspace, "Active");
   await runCli("task", "add", "--workspace", workspace, "Queued");
-  await runCli("queue", "start");
+  await runCli("queue", "start", "--until-idle");
 
   await assert.rejects(
     runCli("task", "move", "2", "--before", "1"),
@@ -409,23 +410,33 @@ test("queue start rechecks a Workspace that became unavailable", async (t) => {
   await runCli("daemon", "start");
   await runCli("task", "add", "--workspace", workspace, "Do work");
   await rm(workspace, { recursive: true });
-  await assert.rejects(runCli("queue", "start"), workspaceError);
+  await assert.rejects(runCli("queue", "start", "--until-idle"), workspaceError);
   assert.doesNotMatch(await readFile(fakeCodex.logPath, "utf8"), /"method":"turn\/start"/);
 });
 
-test("starting the Queue again does not dispatch another Turn", async (t) => {
+test("Queue start, pause, and resume never duplicate the active Turn", async (t) => {
   const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
     completeTurn: false,
   });
 
   await runCli("daemon", "start");
   await runCli("task", "add", "--workspace", workspace, "Keep working");
-  assert.equal(await runCli("queue", "start"), "Queue started.\n");
+  assert.equal(await runCli("queue", "start", "--until-idle"), "Queue started.\n");
   assert.equal(
-    await runCli("queue", "start"),
+    await runCli("queue", "start", "--until-idle"),
     "Queue already has a running Task.\n",
   );
   assert.match(await runCli("queue", "status"), /Task 1: running/);
+  assert.equal(await runCli("queue", "pause"), "Queue paused.\n");
+  assert.match(
+    await runCli("queue", "status"),
+    /Queue is paused\.[\s\S]*Pause reason: manual pause/,
+  );
+  assert.equal(
+    await runCli("queue", "resume", "--until-idle"),
+    "Queue resumed.\n",
+  );
+  assert.match(await runCli("queue", "status"), /Queue Run 2: Until Idle/);
 
   const records = (await readFile(fakeCodex.logPath, "utf8"))
     .trim()

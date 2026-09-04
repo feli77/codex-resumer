@@ -8,8 +8,11 @@ import { promisify } from "node:util";
 
 import { CodexAppServer } from "../src/app-server.js";
 import {
+  addManagedThreadTask,
   addWorkspaceTask,
   getQueueStatus,
+  pauseQueue,
+  resumeQueueRun,
   startDaemon,
   startQueueRun,
   type AppServerController,
@@ -80,6 +83,8 @@ class FakeAppServer implements AppServerController {
   readonly rateLimitReads: Array<Error | RateLimits> = [];
   readonly resumedThreads: string[] = [];
   readonly turns: Array<{ prompt: string; threadId: string; turnId: string }> = [];
+  startThreadCalls = 0;
+  startThreadWait: Promise<void> | undefined;
   #completedListeners = new Set<(turn: CompletedTurn) => void>();
   #usageLimitListeners = new Set<
     (event: { threadId: string; turnId: string }) => void
@@ -101,6 +106,8 @@ class FakeAppServer implements AppServerController {
   }
 
   async startThread() {
+    this.startThreadCalls += 1;
+    await this.startThreadWait;
     return { threadId: "thread-quota" };
   }
 
@@ -143,6 +150,184 @@ class FakeAppServer implements AppServerController {
   }
 }
 
+test("an Until Idle Queue Run is persisted and visible through status", async (t) => {
+  const { paths, workspace } = await createEnvironment(t);
+
+  await addWorkspaceTask(paths, workspace, "Keep going until idle");
+  await startQueueRun(paths, { kind: "until_idle" });
+
+  const snapshot = await getQueueStatus(paths);
+  assert.deepEqual(snapshot.queueRun, {
+    id: 1,
+    runPolicy: "until_idle",
+    startedAt: "2026-09-04T10:00:00.000Z",
+  });
+  assert.equal(snapshot.pauseReason, undefined);
+});
+
+test("an Until Idle Queue Run is durably ended when the Queue becomes idle", async (t) => {
+  const { appServer, paths, workspace } = await createEnvironment(t);
+
+  await addWorkspaceTask(paths, workspace, "Complete this Queue Run");
+  await startQueueRun(paths, { kind: "until_idle" });
+  appServer.emitCompleted("thread-quota", "turn-1");
+  await settle();
+
+  const snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "idle");
+  assert.equal(snapshot.queueRun?.endedAt, "2026-09-04T10:00:00.000Z");
+});
+
+test("Cutoff Time pauses after the active Turn without starting the next Task", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+
+  await addWorkspaceTask(paths, workspace, "Finish the active work");
+  await addWorkspaceTask(paths, workspace, "Do not start this work");
+  await startQueueRun(paths, {
+    cutoffTime: "2026-09-04T10:05:00.000Z",
+    kind: "cutoff_time",
+  });
+  assert.equal(appServer.turns.length, 1);
+
+  clock.advanceTo("2026-09-04T10:05:00.000Z");
+  await settle();
+  let snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "cutoff_reached");
+  assert.equal(snapshot.tasks[0]?.state, "running");
+  assert.equal(snapshot.tasks[1]?.state, "queued");
+  await pauseQueue(paths);
+  assert.equal((await getQueueStatus(paths)).pauseReason, "cutoff_reached");
+
+  appServer.emitCompleted("thread-quota", "turn-1");
+  await settle();
+  snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "completed");
+  assert.equal(snapshot.tasks[1]?.state, "queued");
+  assert.equal(appServer.turns.length, 1);
+  assert.deepEqual(snapshot.queueRun, {
+    cutoffTime: "2026-09-04T10:05:00.000Z",
+    endedAt: "2026-09-04T10:05:00.000Z",
+    id: 1,
+    runPolicy: "cutoff_time",
+    startedAt: "2026-09-04T10:00:00.000Z",
+  });
+});
+
+test("manual pause lets the active Turn finish and resume starts a new Queue Run", async (t) => {
+  const { appServer, paths, workspace } = await createEnvironment(t);
+
+  await addWorkspaceTask(paths, workspace, "Finish before pausing");
+  await startQueueRun(paths, { kind: "until_idle" });
+  await addManagedThreadTask(paths, "thread-quota", "Start after resume");
+  await pauseQueue(paths);
+
+  let snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "manual");
+  assert.equal(snapshot.tasks[0]?.state, "running");
+  assert.equal(appServer.turns.length, 1);
+
+  appServer.emitCompleted("thread-quota", "turn-1");
+  await settle();
+  snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "completed");
+  assert.equal(snapshot.tasks[1]?.state, "queued");
+  assert.equal(appServer.turns.length, 1);
+
+  await resumeQueueRun(paths, { kind: "until_idle" });
+  await waitForTurnCount(appServer, 2);
+  snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "running");
+  assert.equal(snapshot.queueRun?.id, 2);
+  assert.equal(snapshot.queueRun?.runPolicy, "until_idle");
+  assert.equal(snapshot.pauseReason, undefined);
+});
+
+test("crossing Cutoff Time during a Quota Pause does not start a Continuation", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  appServer.rateLimitReads.push(
+    rateLimits({
+      codex: bucket("codex", "rate_limit_reached", 100, epoch("2026-09-04T10:10:00.000Z")),
+    }),
+  );
+
+  await addWorkspaceTask(paths, workspace, "Wait for quota");
+  await startQueueRun(paths, {
+    cutoffTime: "2026-09-04T10:05:00.000Z",
+    kind: "cutoff_time",
+  });
+  appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
+  await waitForTaskState(paths, "waiting_for_quota");
+
+  clock.advanceTo("2026-09-04T10:20:00.000Z");
+  await settle();
+  const snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "cutoff_reached");
+  assert.equal(snapshot.tasks[0]?.state, "waiting_for_quota");
+  assert.equal(appServer.turns.length, 1);
+  assert.equal(appServer.resumedThreads.length, 0);
+});
+
+test("daemon restart cannot bypass an expired Cutoff Time", async (t) => {
+  const { appServer, clock, daemon, paths, workspace } = await createEnvironment(t);
+
+  await addWorkspaceTask(paths, workspace, "Do not resume after cutoff");
+  await startQueueRun(paths, {
+    cutoffTime: "2026-09-04T10:05:00.000Z",
+    kind: "cutoff_time",
+  });
+  await daemon.close();
+  clock.advanceTo("2026-09-04T10:20:00.000Z");
+
+  const replacementAppServer = new FakeAppServer();
+  const replacement = await startDaemon({
+    appServer: replacementAppServer,
+    clock,
+    paths,
+  });
+  assert.equal(replacement.kind, "started");
+  if (replacement.kind !== "started") throw new Error("replacement did not start");
+  try {
+    const snapshot = await getQueueStatus(paths);
+    assert.equal(snapshot.state, "paused");
+    assert.equal(snapshot.pauseReason, "cutoff_reached");
+    assert.equal(snapshot.queueRun?.endedAt, "2026-09-04T10:20:00.000Z");
+    assert.equal(replacementAppServer.turns.length, 0);
+    assert.equal(appServer.turns.length, 1);
+  } finally {
+    await replacement.daemon.close();
+  }
+});
+
+test("a Turn is not started when Cutoff Time passes while its Thread is starting", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  let releaseThreadStart: (() => void) | undefined;
+  appServer.startThreadWait = new Promise((resolve) => {
+    releaseThreadStart = resolve;
+  });
+
+  await addWorkspaceTask(paths, workspace, "Do not cross the cutoff");
+  const starting = startQueueRun(paths, {
+    cutoffTime: "2026-09-04T10:05:00.000Z",
+    kind: "cutoff_time",
+  });
+  while (appServer.startThreadCalls === 0) await settle();
+  clock.advanceTo("2026-09-04T10:05:00.000Z");
+  await settle();
+  releaseThreadStart?.();
+  assert.equal(await starting, "paused");
+
+  const snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "cutoff_reached");
+  assert.equal(snapshot.tasks[0]?.state, "queued");
+  assert.equal(appServer.turns.length, 0);
+});
+
 test("a structured quota pause waits for the matching reset before continuing in the same Thread", async (t) => {
   const { appServer, clock, paths, workspace } = await createEnvironment(t);
   appServer.rateLimitReads.push(
@@ -157,7 +342,7 @@ test("a structured quota pause waits for the matching reset before continuing in
   );
 
   await addWorkspaceTask(paths, workspace, "Apply the database migration");
-  await startQueueRun(paths);
+  await startQueueRun(paths, { kind: "until_idle" });
   assert.deepEqual(appServer.turns, [{
     prompt: "Apply the database migration",
     threadId: "thread-quota",
@@ -244,7 +429,7 @@ test("a missing reset time uses bounded exponential polling", async (t) => {
   );
 
   await addWorkspaceTask(paths, workspace, "Long running work");
-  await startQueueRun(paths);
+  await startQueueRun(paths, { kind: "until_idle" });
   appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
   await waitForTaskState(paths, "waiting_for_quota");
 
@@ -295,7 +480,7 @@ test("the reached legacy bucket is not hidden by an unrelated multi-bucket view"
   );
 
   await addWorkspaceTask(paths, workspace, "Continue the right work");
-  await startQueueRun(paths);
+  await startQueueRun(paths, { kind: "until_idle" });
   appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
   const waiting = await waitForTaskState(paths, "waiting_for_quota");
   assert.equal(waiting.tasks[0]?.quotaLimitId, "codex");
@@ -332,7 +517,7 @@ test("polling discovers a reached bucket after the initial rate-limit read fails
   );
 
   await addWorkspaceTask(paths, workspace, "Recover after a transient read failure");
-  await startQueueRun(paths);
+  await startQueueRun(paths, { kind: "until_idle" });
   appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
   await waitForTaskState(paths, "waiting_for_quota");
 
@@ -359,7 +544,7 @@ test("Until Idle recovers from repeated Quota Pauses", async (t) => {
   );
 
   await addWorkspaceTask(paths, workspace, "Finish every step");
-  await startQueueRun(paths);
+  await startQueueRun(paths, { kind: "until_idle" });
   appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
   await waitForTaskState(paths, "waiting_for_quota");
   clock.advanceTo("2026-09-04T10:05:02.000Z");
@@ -422,7 +607,7 @@ test("the global Continuation prompt has a default and can be replaced", async (
     await rm(root, { recursive: true, force: true });
   });
   await addWorkspaceTask(paths, workspace, "Original prompt");
-  await startQueueRun(paths);
+  await startQueueRun(paths, { kind: "until_idle" });
   appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
   await waitForTaskState(paths, "waiting_for_quota");
   assert.equal(
@@ -466,7 +651,7 @@ async function createEnvironment(t: TestContext) {
     await result.daemon.close();
     await rm(root, { recursive: true, force: true });
   });
-  return { appServer, clock, paths, workspace };
+  return { appServer, clock, daemon: result.daemon, paths, workspace };
 }
 
 function bucket(

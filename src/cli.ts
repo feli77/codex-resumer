@@ -13,12 +13,15 @@ import {
   getQueueStatus,
   importManagedThread,
   moveTask,
+  pauseQueue,
+  resumeQueueRun,
   startDaemon,
   startQueueRun,
   stopDaemon,
   type DaemonStatus,
   type RunningDaemon,
 } from "./daemon.js";
+import { normalizeCutoffTime, type RunPolicy } from "./run-policy.js";
 import type { QueueSnapshot } from "./state-store.js";
 import { resolvePaths, type DaemonPaths } from "./paths.js";
 
@@ -28,7 +31,10 @@ const usage = `Usage:
   codex-resumer task <list|cancel <task-id>>
   codex-resumer task move <task-id> (--before|--after) <task-id>
   codex-resumer thread import <thread-id>
-  codex-resumer queue <start|status>
+  codex-resumer queue start (--until-idle | --cutoff <timestamp>)
+  codex-resumer queue pause
+  codex-resumer queue resume (--until-idle | --cutoff <timestamp>)
+  codex-resumer queue status
   codex-resumer config show
   codex-resumer config set continuationPrompt <prompt>
 
@@ -106,14 +112,42 @@ async function main(args: string[]): Promise<number> {
     return 0;
   }
 
-  if (args[0] === "queue" && args[1] === "start" && args.length === 2) {
-    const result = await startQueueRun(paths);
+  if (args[0] === "queue" && args[1] === "start") {
+    const result = await startQueueRun(
+      paths,
+      parseRunPolicy(args.slice(2), "queue start"),
+    );
     process.stdout.write(
       result === "started"
         ? "Queue started.\n"
         : result === "already-running"
           ? "Queue already has a running Task.\n"
-          : "Queue is idle.\n",
+          : result === "paused"
+            ? "Queue is paused.\n"
+            : "Queue is idle.\n",
+    );
+    return 0;
+  }
+
+  if (args[0] === "queue" && args[1] === "pause" && args.length === 2) {
+    await pauseQueue(paths);
+    process.stdout.write("Queue paused.\n");
+    return 0;
+  }
+
+  if (args[0] === "queue" && args[1] === "resume") {
+    const result = await resumeQueueRun(
+      paths,
+      parseRunPolicy(args.slice(2), "queue resume"),
+    );
+    process.stdout.write(
+      result === "started"
+        ? "Queue resumed.\n"
+        : result === "already-running"
+          ? "Queue is already running.\n"
+          : result === "paused"
+            ? "Queue is paused.\n"
+            : "Queue is idle.\n",
     );
     return 0;
   }
@@ -229,6 +263,23 @@ function renderStatus(status: DaemonStatus): string {
 
 function renderQueueStatus(snapshot: QueueSnapshot): string {
   const lines = [`Queue is ${snapshot.state}.`];
+  if (snapshot.pauseReason) {
+    lines.push(`Pause reason: ${renderPauseReason(snapshot.pauseReason)}.`);
+  }
+  if (snapshot.queueRun) {
+    lines.push(
+      `Queue Run ${snapshot.queueRun.id}: ${
+        snapshot.queueRun.runPolicy === "until_idle" ? "Until Idle" : "Cutoff Time"
+      }`,
+    );
+    lines.push(`  Started ${snapshot.queueRun.startedAt}`);
+    if (snapshot.queueRun.cutoffTime) {
+      lines.push(`  Cutoff Time ${snapshot.queueRun.cutoffTime}`);
+    }
+    if (snapshot.queueRun.endedAt) {
+      lines.push(`  Ended ${snapshot.queueRun.endedAt}`);
+    }
+  }
   for (const task of snapshot.tasks) {
     lines.push(`Task ${task.id}: ${task.state}`);
     lines.push(`  Workspace ${task.workspace}`);
@@ -244,6 +295,21 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
     }
   }
   return `${lines.join("\n")}\n`;
+}
+
+function renderPauseReason(reason: NonNullable<QueueSnapshot["pauseReason"]>): string {
+  switch (reason) {
+    case "cutoff_reached":
+      return "Cutoff Time reached";
+    case "manual":
+      return "manual pause";
+    case "not_started":
+      return "not started";
+    case "needs_attention":
+      return "Needs Attention";
+    case "run_policy_required":
+      return "Run Policy required";
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -296,6 +362,19 @@ function parseTaskId(value: string | undefined): number {
     throw new Error(`Invalid Task ID: ${value ?? "missing"}`);
   }
   return taskId;
+}
+
+function parseRunPolicy(args: string[], command: string): RunPolicy {
+  if (args.length === 1 && args[0] === "--until-idle") {
+    return { kind: "until_idle" };
+  }
+  if (args.length === 2 && args[0] === "--cutoff") {
+    const cutoff = args[1];
+    if (cutoff) {
+      return { cutoffTime: normalizeCutoffTime(cutoff), kind: "cutoff_time" };
+    }
+  }
+  throw new Error(`${command} requires --until-idle or --cutoff <timestamp>.`);
 }
 
 void main(process.argv.slice(2))

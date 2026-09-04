@@ -43,3 +43,33 @@ test("CLI starts one detached daemon, reports it, and stops it", async (t) => {
   assert.match(await runCli("daemon", "stop"), /Daemon stopped/);
   assert.match(await runCli("daemon", "status"), /Daemon is stopped/);
 });
+
+test("queue start requires an explicit Run Policy with a zoned Cutoff Time", async () => {
+  const runCli = (...args: string[]) =>
+    execFileAsync(process.execPath, [cliPath, ...args], { encoding: "utf8" });
+
+  await assert.rejects(
+    runCli("queue", "start"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /requires --until-idle or --cutoff/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    runCli("queue", "start", "--cutoff", "2099-01-01T08:00:00"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /explicit timezone/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    runCli("queue", "resume"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /queue resume requires --until-idle or --cutoff/);
+      return true;
+    },
+  );
+});
