@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,6 +28,7 @@ async function createCliTestEnvironment(
     HOME: root,
     PATH: `${root}:${process.env.PATH ?? ""}`,
     FAKE_CODEX_LOG: fakeCodex.logPath,
+    FAKE_CODEX_IMPORTED_WORKSPACE: workspace,
     XDG_CONFIG_HOME: path.join(root, "config"),
     XDG_RUNTIME_DIR: path.join(root, "runtime"),
     XDG_STATE_HOME: stateDir,
@@ -41,11 +42,32 @@ async function createCliTestEnvironment(
     });
     return stdout;
   };
+  const runCliWithInput = (input: string, ...args: string[]): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [cliPath, ...args], {
+        cwd: root,
+        env,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.once("error", reject);
+      child.once("close", (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(stderr));
+      });
+      child.stdin.end(input);
+    });
   t.after(async () => {
     await runCli("daemon", "stop").catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   });
-  return { fakeCodex, root, runCli, stateDir, workspace };
+  return { env, fakeCodex, root, runCli, runCliWithInput, stateDir, workspace };
 }
 
 test("a Workspace Task runs once and completes without an output marker", async (t) => {
@@ -126,6 +148,250 @@ test("a Workspace Task runs once and completes without an output marker", async 
   });
 });
 
+test("a Thread is explicitly imported with its App Server Workspace", async (t) => {
+  const { runCli, workspace } = await createCliTestEnvironment(t);
+
+  await runCli("daemon", "start");
+  assert.equal(
+    await runCli("thread", "import", "thread-imported"),
+    `Thread thread-imported imported for Workspace ${workspace}.\n`,
+  );
+});
+
+test("thread import rejects a Thread the App Server cannot read", async (t) => {
+  const { runCli } = await createCliTestEnvironment(t);
+
+  await runCli("daemon", "start");
+  await assert.rejects(
+    runCli("thread", "import", "thread-missing"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /Thread does not exist/);
+      return true;
+    },
+  );
+});
+
+test("a Managed Thread cannot be rebound to another Workspace", async (t) => {
+  const { env, root, runCli } = await createCliTestEnvironment(t);
+  const otherWorkspace = path.join(root, "other-workspace");
+  await mkdir(otherWorkspace);
+
+  await runCli("daemon", "start");
+  await runCli("thread", "import", "thread-imported");
+  await runCli("daemon", "stop");
+  env.FAKE_CODEX_IMPORTED_WORKSPACE = otherWorkspace;
+  await runCli("daemon", "start");
+
+  await assert.rejects(
+    runCli("thread", "import", "thread-imported"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /already bound to Workspace/);
+      return true;
+    },
+  );
+});
+
+test("a Task targeting a Managed Thread resumes that Thread", async (t) => {
+  const { fakeCodex, runCli } = await createCliTestEnvironment(t, {
+    completeTurnSynchronously: true,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("thread", "import", "thread-imported");
+  assert.equal(
+    await runCli("task", "add", "--thread", "thread-imported", "Continue work"),
+    "Task 1 added.\n",
+  );
+  assert.equal(await runCli("queue", "start"), "Queue started.\n");
+
+  const status = await runCli("queue", "status");
+  assert.match(status, /Task 1: completed/);
+  assert.match(status, /Thread thread-imported, Turn turn-fake/);
+
+  const methods = (await readFakeMessages(fakeCodex.logPath)).map(
+    (message) => message.method,
+  );
+  assert.deepEqual(
+    methods.filter((method) => method?.startsWith("thread/")),
+    ["thread/read", "thread/resume"],
+  );
+});
+
+test("task add accepts a multiline prompt from stdin", async (t) => {
+  const { fakeCodex, runCli, runCliWithInput, workspace } =
+    await createCliTestEnvironment(t, { completeTurnSynchronously: true });
+
+  await runCli("daemon", "start");
+  assert.equal(
+    await runCliWithInput(
+      "First line\nSecond line\n",
+      "task",
+      "add",
+      "--workspace",
+      workspace,
+    ),
+    "Task 1 added.\n",
+  );
+  await runCli("queue", "start");
+
+  const turnStart = (await readFakeMessages(fakeCodex.logPath)).find(
+    (message) => message.method === "turn/start",
+  );
+  assert.deepEqual(turnStart?.params?.input, [{
+    type: "text",
+    text: "First line\nSecond line\n",
+  }]);
+});
+
+test("task add rejects more than one target", async (t) => {
+  const { runCli, workspace } = await createCliTestEnvironment(t);
+
+  await runCli("daemon", "start");
+  await runCli("thread", "import", "thread-imported");
+  await assert.rejects(
+    runCli(
+      "task",
+      "add",
+      "--workspace",
+      workspace,
+      "--thread",
+      "thread-imported",
+      "Do work",
+    ),
+    taskTargetError,
+  );
+});
+
+test("Tasks run FIFO across Managed Threads and new Workspace Threads", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurnSynchronously: true,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("thread", "import", "thread-imported");
+  await runCli("task", "add", "--workspace", workspace, "First");
+  await runCli("task", "add", "--thread", "thread-imported", "Second");
+  await runCli("task", "add", "--workspace", workspace, "Third");
+  assert.equal(await runCli("queue", "start"), "Queue started.\n");
+
+  const status = await waitForQueueStatus(runCli, "Task 3: completed");
+  assert.match(status, /Task 1: completed[\s\S]*Task 2: completed[\s\S]*Task 3: completed/);
+
+  const messages = await readFakeMessages(fakeCodex.logPath);
+  assert.deepEqual(
+    messages
+      .filter((message) => message.method === "turn/start")
+      .map((message) => {
+        const input = message.params?.input as Array<{ text?: string }> | undefined;
+        return input?.[0]?.text;
+      }),
+    ["First", "Second", "Third"],
+  );
+  assert.deepEqual(
+    messages
+      .map((message) => message.method)
+      .filter((method) => method?.startsWith("thread/")),
+    ["thread/read", "thread/start", "thread/resume", "thread/start"],
+  );
+});
+
+test("queued Tasks can be added, moved, and cancelled while a Task is active", async (t) => {
+  const { fakeCodex, runCli, stateDir, workspace } = await createCliTestEnvironment(t, {
+    turnCompletionDelayMs: 500,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Active secret");
+  await runCli("task", "add", "--workspace", workspace, "Second secret");
+  await runCli("queue", "start");
+  await runCli("task", "add", "--workspace", workspace, "Cancel secret");
+  await runCli("task", "add", "--workspace", workspace, "Move secret");
+  assert.equal(await runCli("task", "move", "4", "--before", "2"), "Task 4 moved.\n");
+  assert.equal(await runCli("task", "cancel", "3"), "Task 3 cancelled.\n");
+
+  const list = await runCli("task", "list");
+  assert.match(
+    list,
+    /Task 1: running[\s\S]*Task 4: queued[\s\S]*Task 2: queued[\s\S]*Task 3: cancelled/,
+  );
+  assert.match(list, /Task 1: running[\s\S]*Thread thread-fake, Turn turn-fake/);
+  assert.doesNotMatch(list, /Active secret|Second secret|Cancel secret|Move secret/);
+
+  const database = new Database(
+    path.join(stateDir, "codex-resumer", "state.sqlite3"),
+    { readonly: true },
+  );
+  t.after(() => database.close());
+  assert.deepEqual(
+    database.prepare("SELECT state, prompt FROM tasks WHERE id = 3").get(),
+    { state: "cancelled", prompt: null },
+  );
+
+  const completed = await waitForQueueStatus(runCli, "Task 2: completed");
+  assert.match(completed, /Queue is idle/);
+  assert.deepEqual(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start")
+      .map((message) => {
+        const input = message.params?.input as Array<{ text?: string }> | undefined;
+        return input?.[0]?.text;
+      }),
+    ["Active secret", "Move secret", "Second secret"],
+  );
+});
+
+test("a queued Task cannot move before the active Task", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurn: false,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Active");
+  await runCli("task", "add", "--workspace", workspace, "Queued");
+  await runCli("queue", "start");
+
+  await assert.rejects(
+    runCli("task", "move", "2", "--before", "1"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /cannot move before the active Task/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    runCli("task", "cancel", "1"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /Task 1 is not queued/);
+      return true;
+    },
+  );
+  assert.match(
+    await runCli("task", "list"),
+    /Task 1: running[\s\S]*Task 2: queued/,
+  );
+  const methods = (await readFakeMessages(fakeCodex.logPath)).map(
+    (message) => message.method,
+  );
+  assert.equal(methods.filter((method) => method === "turn/start").length, 1);
+  assert.equal(methods.includes("turn/interrupt"), false);
+});
+
+test("issue 3 Queue state is migrated without losing Task IDs", async (t) => {
+  const { runCli, stateDir, workspace } = await createCliTestEnvironment(t);
+  await createIssue3Database(stateDir, workspace);
+
+  await runCli("daemon", "start");
+  assert.match(await runCli("task", "list"), /Task 1: queued/);
+  assert.equal(await runCli("task", "cancel", "1"), "Task 1 cancelled.\n");
+  assert.equal(
+    await runCli("task", "add", "--workspace", workspace, "New Task"),
+    "Task 2 added.\n",
+  );
+});
+
 test("task add rejects a missing Workspace before a Turn can start", async (t) => {
   const { fakeCodex, root, runCli } = await createCliTestEnvironment(t);
 
@@ -175,4 +441,89 @@ function workspaceError(error: unknown): boolean {
   assert.ok(error instanceof Error && "stderr" in error);
   assert.match(String(error.stderr), /Workspace is not an accessible directory/);
   return true;
+}
+
+function taskTargetError(error: unknown): boolean {
+  assert.ok(error instanceof Error && "stderr" in error);
+  assert.match(String(error.stderr), /exactly one Managed Thread or Workspace/);
+  return true;
+}
+
+async function readFakeMessages(
+  logPath: string,
+): Promise<Array<{ method?: string; params?: Record<string, unknown> }>> {
+  return (await readFile(logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as {
+      type: string;
+      message?: { method?: string; params?: Record<string, unknown> };
+    })
+    .filter((record) => record.type === "message")
+    .map((record) => record.message ?? {});
+}
+
+async function waitForQueueStatus(
+  runCli: (...args: string[]) => Promise<string>,
+  expected: string,
+): Promise<string> {
+  let status = "";
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    status = await runCli("queue", "status");
+    if (status.includes(expected)) return status;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return status;
+}
+
+async function createIssue3Database(stateDir: string, workspace: string): Promise<void> {
+  const applicationStateDir = path.join(stateDir, "codex-resumer");
+  await mkdir(applicationStateDir, { recursive: true });
+  const database = new Database(path.join(applicationStateDir, "state.sqlite3"));
+  try {
+    database.exec(`
+      CREATE TABLE queue (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        state TEXT NOT NULL CHECK (state IN ('paused', 'running')),
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace TEXT NOT NULL,
+        prompt TEXT,
+        state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed')),
+        managed_thread_id TEXT,
+        active_turn_id TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+      );
+      CREATE UNIQUE INDEX one_running_task
+        ON tasks(state) WHERE state = 'running';
+      CREATE TABLE managed_threads (
+        id TEXT PRIMARY KEY,
+        workspace TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'idle')),
+        created_at TEXT NOT NULL,
+        last_turn_completed_at TEXT
+      );
+      CREATE TABLE turns (
+        id TEXT PRIMARY KEY,
+        task_id INTEGER NOT NULL REFERENCES tasks(id),
+        managed_thread_id TEXT NOT NULL REFERENCES managed_threads(id),
+        state TEXT NOT NULL CHECK (state IN ('in_progress', 'completed')),
+        started_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+    `);
+    database.prepare(`
+      INSERT INTO queue (id, state, updated_at) VALUES (1, 'paused', ?)
+    `).run("2026-09-04T00:00:00.000Z");
+    database.prepare(`
+      INSERT INTO tasks (workspace, prompt, state, created_at)
+      VALUES (?, 'Existing Task', 'queued', ?)
+    `).run(workspace, "2026-09-04T00:00:00.000Z");
+  } finally {
+    database.close();
+  }
 }

@@ -199,10 +199,11 @@ interface PendingRequest {
 
 class AppServerRpcError extends Error {
   constructor(
+    message: string,
     readonly code: number | undefined,
     readonly data: unknown,
   ) {
-    super("Codex App Server rejected a startup request");
+    super(message);
     this.name = "AppServerRpcError";
   }
 }
@@ -314,6 +315,34 @@ export class CodexAppServer implements AppServerController {
       throw new Error("Codex App Server returned an invalid Thread response");
     }
     return { threadId: result.thread.id };
+  }
+
+  async readThread(threadId: string): Promise<{ threadId: string; workspace: string }> {
+    const result = await this.#request("thread/read", {
+      threadId,
+      includeTurns: false,
+    });
+    if (
+      !isRecord(result)
+      || !isRecord(result.thread)
+      || result.thread.id !== threadId
+      || typeof result.thread.cwd !== "string"
+    ) {
+      throw new Error("Codex App Server returned an invalid Thread response");
+    }
+    return { threadId, workspace: result.thread.cwd };
+  }
+
+  async resumeThread(threadId: string): Promise<{ threadId: string }> {
+    const result = await this.#request("thread/resume", { threadId });
+    if (
+      !isRecord(result)
+      || !isRecord(result.thread)
+      || result.thread.id !== threadId
+    ) {
+      throw new Error("Codex App Server returned an invalid Thread response");
+    }
+    return { threadId };
   }
 
   async startTurn(threadId: string, prompt: string): Promise<{ turnId: string }> {
@@ -449,10 +478,15 @@ export class CodexAppServer implements AppServerController {
     this.#pending.delete(message.id);
     if (message.error !== undefined) {
       const rpcError = isRecord(message.error) ? message.error : {};
-      pending.reject(new AppServerRpcError(
-        typeof rpcError.code === "number" ? rpcError.code : undefined,
-        rpcError.data,
-      ));
+      pending.reject(
+        new AppServerRpcError(
+          typeof rpcError.message === "string"
+            ? rpcError.message
+            : "Codex App Server rejected the request",
+          typeof rpcError.code === "number" ? rpcError.code : undefined,
+          rpcError.data,
+        ),
+      );
     } else {
       pending.resolve(message.result);
     }
@@ -513,8 +547,8 @@ function threadResponseContract(
       { properties: ["thread"], required: ["thread"] },
       {
         definition: "Thread",
-        properties: ["id", "status", "turns"],
-        required: ["id", "status", "turns"],
+        properties: ["id", "cwd", "status", "turns"],
+        required: ["id", "cwd", "status", "turns"],
       },
       {
         definition: "Turn",

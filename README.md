@@ -2,8 +2,8 @@
 
 Codex Resumer is a local Linux CLI and daemon for coordinating Codex work across
 temporary usage interruptions. It provides a capability-checked daemon
-lifecycle and can run a Workspace Task to completion through a durable local
-Queue.
+lifecycle and runs a durable global FIFO Queue across new Workspace Threads and
+explicitly imported Managed Threads.
 
 ## Requirements
 
@@ -41,7 +41,7 @@ codex-resumer daemon status
 codex-resumer daemon stop
 ```
 
-Add a Task for an existing Workspace, start the Queue, and inspect its state:
+Add Tasks for new Threads in a Workspace, start the Queue, and inspect its state:
 
 ```sh
 codex-resumer task add --workspace ./my-workspace "Implement the requested change"
@@ -49,10 +49,39 @@ codex-resumer queue start
 codex-resumer queue status
 ```
 
+Import an existing Thread, add a Task to it, or supply a multiline prompt on
+stdin:
+
+```sh
+codex-resumer thread import <thread-id>
+codex-resumer task add --thread <thread-id> "Continue the existing work"
+codex-resumer task add --workspace ./my-workspace <<'PROMPT'
+Implement the requested change.
+Run the focused tests when finished.
+PROMPT
+```
+
+Tasks run one at a time in displayed order. While a Task is active, queued
+Tasks can be added, moved, or cancelled without changing the active Turn:
+
+```sh
+codex-resumer task list
+codex-resumer task move 4 --before 2
+codex-resumer task move 4 --after 2
+codex-resumer task cancel 3
+```
+
+Only queued Tasks can be moved or cancelled, and a queued Task cannot be moved
+before the active Task. Cancelling a Task keeps its terminal metadata but
+removes its prompt. `task list` and `queue status` show Queue order, state,
+Workspace, Thread, and Turn identifiers without displaying prompts.
+
 Workspace paths are stored as canonical absolute paths. A successful Codex Turn
-completes the Task; no marker is required in the model output. New Threads and
-Turns omit model, reasoning, and personality overrides, so Codex uses the
-user's current defaults.
+completes the Task and starts the next queued Task; no marker is required in the
+model output. Every Workspace target creates a new Thread. Imported Threads are
+validated with App Server and permanently bound to their recorded Workspace.
+New Threads and Turns omit model, reasoning, and personality overrides, so Codex
+uses the user's current defaults.
 
 `daemon start` detaches from the terminal. Starting it again is safe and keeps a
 single daemon instance. At startup, Codex Resumer checks the installed protocol

@@ -8,6 +8,7 @@ interface FakeCodexOptions {
   completeTurnSynchronously?: boolean;
   omitClientRequest?: string;
   omitRateLimitResetTime?: boolean;
+  turnCompletionDelayMs?: number;
 }
 
 export async function createFakeCodex(
@@ -83,8 +84,8 @@ if (args[0] === "app-server" && args[1] === "generate-json-schema") {
   const threadDefinitions = {
     ...turnDefinitions,
     Thread: {
-      properties: properties("id", "status", "turns"),
-      required: ["id", "status", "turns"],
+      properties: properties("id", "cwd", "status", "turns"),
+      required: ["id", "cwd", "status", "turns"],
     },
   };
   const rateLimitDefinitions = {
@@ -221,6 +222,9 @@ if (args[0] === "app-server" && args[1] === "generate-json-schema") {
 if (args[0] !== "app-server" || args[1] !== "--stdio") process.exit(2);
 
 const lines = readline.createInterface({ input: process.stdin });
+const threads = new Map();
+let startedThreadCount = 0;
+let turnCount = 0;
 lines.on("line", (line) => {
   const message = JSON.parse(line);
   log({ type: "message", message });
@@ -250,11 +254,49 @@ lines.on("line", (line) => {
       rateLimitsByLimitId: null,
     } }));
   } else if (message.method === "thread/start") {
-    const thread = { id: "thread-fake", status: "idle", turns: [] };
+    startedThreadCount += 1;
+    const threadId = startedThreadCount === 1
+      ? "thread-fake"
+      : "thread-fake-" + startedThreadCount;
+    const thread = {
+      id: threadId,
+      cwd: message.params.cwd,
+      status: "idle",
+      turns: [],
+    };
+    threads.set(threadId, message.params.cwd);
     console.log(JSON.stringify({ id: message.id, result: { thread } }));
     console.log(JSON.stringify({ method: "thread/started", params: { thread } }));
+  } else if (message.method === "thread/read") {
+    if (message.params.threadId === "thread-missing") {
+      console.log(JSON.stringify({ id: message.id, error: {
+        code: -32001,
+        message: "Thread does not exist",
+      } }));
+      return;
+    }
+    const workspace = threads.get(message.params.threadId)
+      ?? process.env.FAKE_CODEX_IMPORTED_WORKSPACE;
+    const thread = {
+      id: message.params.threadId,
+      cwd: workspace,
+      status: "idle",
+      turns: [],
+    };
+    threads.set(message.params.threadId, workspace);
+    console.log(JSON.stringify({ id: message.id, result: { thread } }));
+  } else if (message.method === "thread/resume") {
+    const thread = {
+      id: message.params.threadId,
+      cwd: threads.get(message.params.threadId),
+      status: "idle",
+      turns: [],
+    };
+    console.log(JSON.stringify({ id: message.id, result: { thread } }));
   } else if (message.method === "turn/start") {
-    const turn = { id: "turn-fake", status: "inProgress", items: [] };
+    turnCount += 1;
+    const turnId = turnCount === 1 ? "turn-fake" : "turn-fake-" + turnCount;
+    const turn = { id: turnId, status: "inProgress", items: [] };
     const response = JSON.stringify({ id: message.id, result: { turn } });
     if (${String(options.completeTurn !== false)}) {
       const completed = JSON.stringify({ method: "turn/completed", params: {
@@ -265,7 +307,10 @@ lines.on("line", (line) => {
         process.stdout.write(response + "\\n" + completed + "\\n");
       } else {
         console.log(response);
-        setTimeout(() => console.log(completed), 10);
+        setTimeout(
+          () => console.log(completed),
+          ${String(options.turnCompletionDelayMs ?? 10)},
+        );
       }
     } else console.log(response);
   }

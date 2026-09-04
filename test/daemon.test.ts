@@ -16,8 +16,14 @@ import { createFakeCodex } from "./fake-codex.js";
 
 const unusedTaskExecution: Pick<
   AppServerController,
-  "startThread" | "startTurn" | "onTurnCompleted"
+  "readThread" | "resumeThread" | "startThread" | "startTurn" | "onTurnCompleted"
 > = {
+  async readThread() {
+    throw new Error("not used by daemon lifecycle tests");
+  },
+  async resumeThread() {
+    throw new Error("not used by daemon lifecycle tests");
+  },
   async startThread() {
     throw new Error("not used by daemon lifecycle tests");
   },

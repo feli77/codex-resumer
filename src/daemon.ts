@@ -21,6 +21,8 @@ export interface Clock {
 
 export interface AppServerController {
   startAndProbe(): Promise<AppServerProbeResult>;
+  readThread(threadId: string): Promise<{ threadId: string; workspace: string }>;
+  resumeThread(threadId: string): Promise<{ threadId: string }>;
   startThread(workspace: string): Promise<{ threadId: string }>;
   startTurn(threadId: string, prompt: string): Promise<{ turnId: string }>;
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void;
@@ -188,6 +190,64 @@ export async function addWorkspaceTask(
     throw new Error("daemon returned an invalid Task result");
   }
   return result.taskId;
+}
+
+export async function addManagedThreadTask(
+  paths: DaemonPaths,
+  threadId: string,
+  prompt: string,
+): Promise<number> {
+  const result = await requestResult(paths.socketPath, {
+    method: "task/add",
+    params: { threadId, prompt },
+  });
+  if (!isRecord(result) || typeof result.taskId !== "number") {
+    throw new Error("daemon returned an invalid Task result");
+  }
+  return result.taskId;
+}
+
+export async function importManagedThread(
+  paths: DaemonPaths,
+  threadId: string,
+): Promise<{ threadId: string; workspace: string }> {
+  const result = await requestResult(paths.socketPath, {
+    method: "thread/import",
+    params: { threadId },
+  });
+  if (
+    !isRecord(result)
+    || typeof result.threadId !== "string"
+    || typeof result.workspace !== "string"
+  ) {
+    throw new Error("daemon returned an invalid Managed Thread result");
+  }
+  return { threadId: result.threadId, workspace: result.workspace };
+}
+
+export async function moveTask(
+  paths: DaemonPaths,
+  taskId: number,
+  relativeTaskId: number,
+  placement: "after" | "before",
+): Promise<void> {
+  const result = await requestResult(paths.socketPath, {
+    method: "task/move",
+    params: { taskId, relativeTaskId, placement },
+  });
+  if (!isRecord(result) || result.taskId !== taskId) {
+    throw new Error("daemon returned an invalid Task move result");
+  }
+}
+
+export async function cancelTask(paths: DaemonPaths, taskId: number): Promise<void> {
+  const result = await requestResult(paths.socketPath, {
+    method: "task/cancel",
+    params: { taskId },
+  });
+  if (!isRecord(result) || result.taskId !== taskId) {
+    throw new Error("daemon returned an invalid Task cancellation result");
+  }
 }
 
 export async function startQueueRun(
@@ -469,7 +529,12 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
     isRecord(task)
     && typeof task.id === "number"
     && typeof task.workspace === "string"
-    && (task.state === "queued" || task.state === "running" || task.state === "completed")
+    && (
+      task.state === "queued"
+      || task.state === "running"
+      || task.state === "completed"
+      || task.state === "cancelled"
+    )
     && (task.managedThreadId === undefined || typeof task.managedThreadId === "string")
     && (task.activeTurnId === undefined || typeof task.activeTurnId === "string")
   );
