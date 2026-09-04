@@ -64,9 +64,8 @@ export class StateStore {
 
       CREATE TABLE IF NOT EXISTS managed_threads (
         id TEXT PRIMARY KEY,
-        task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
         workspace TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('active', 'completed')),
+        state TEXT NOT NULL CHECK (state IN ('active', 'idle')),
         created_at TEXT NOT NULL,
         completed_at TEXT
       );
@@ -139,9 +138,9 @@ export class StateStore {
   ): void {
     this.#database.transaction(() => {
       this.#database.prepare(`
-        INSERT INTO managed_threads (id, task_id, workspace, state, created_at)
-        VALUES (?, ?, ?, 'active', ?)
-      `).run(managedThreadId, task.id, task.workspace, now.toISOString());
+        INSERT INTO managed_threads (id, workspace, state, created_at)
+        VALUES (?, ?, 'active', ?)
+      `).run(managedThreadId, task.workspace, now.toISOString());
       this.#database.prepare(`
         UPDATE tasks SET managed_thread_id = ? WHERE id = ? AND state = 'running'
       `).run(managedThreadId, task.id);
@@ -165,13 +164,13 @@ export class StateStore {
     })();
   }
 
-  completeTurn(managedThreadId: string, turnId: string, now: Date): void {
-    this.#database.transaction(() => {
+  completeTurn(managedThreadId: string, turnId: string, now: Date): boolean {
+    return this.#database.transaction(() => {
       const turn = this.#database.prepare(`
         SELECT task_id FROM turns
         WHERE id = ? AND managed_thread_id = ? AND state = 'in_progress'
       `).get(turnId, managedThreadId) as { task_id: number } | undefined;
-      if (!turn) return;
+      if (!turn) return false;
 
       const completedAt = now.toISOString();
       this.#database.prepare(`
@@ -179,12 +178,13 @@ export class StateStore {
       `).run(completedAt, turnId);
       this.#database.prepare(`
         UPDATE managed_threads
-        SET state = 'completed', completed_at = ? WHERE id = ?
+        SET state = 'idle', completed_at = ? WHERE id = ?
       `).run(completedAt, managedThreadId);
       this.#database.prepare(`
         UPDATE tasks SET state = 'completed', prompt = NULL, completed_at = ?
         WHERE id = ? AND state = 'running'
       `).run(completedAt, turn.task_id);
+      return true;
     })();
   }
 

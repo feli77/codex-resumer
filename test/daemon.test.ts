@@ -14,6 +14,21 @@ import {
 import { resolvePaths } from "../src/paths.js";
 import { createFakeCodex } from "./fake-codex.js";
 
+const unusedTaskExecution: Pick<
+  AppServerController,
+  "startThread" | "startTurn" | "onTurnCompleted"
+> = {
+  async startThread() {
+    throw new Error("not used by daemon lifecycle tests");
+  },
+  async startTurn() {
+    throw new Error("not used by daemon lifecycle tests");
+  },
+  onTurnCompleted() {
+    return () => undefined;
+  },
+};
+
 async function createTestEnvironment() {
   const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
   return {
@@ -37,6 +52,7 @@ test("daemon status reports stopped before the daemon has started", async (t) =>
 test("daemon status crosses the private socket boundary", async (t) => {
   const { root, paths } = await createTestEnvironment();
   const appServer: AppServerController = {
+    ...unusedTaskExecution,
     async startAndProbe() {
       return { state: "ready", codexVersion: "codex-cli 0.test" };
     },
@@ -73,6 +89,7 @@ test("repeated start keeps a single daemon and stop uses its request boundary", 
   let firstProbeCalls = 0;
   let secondProbeCalls = 0;
   const firstAppServer: AppServerController = {
+    ...unusedTaskExecution,
     async startAndProbe() {
       firstProbeCalls += 1;
       return { state: "ready", codexVersion: "codex-cli first" };
@@ -80,6 +97,7 @@ test("repeated start keeps a single daemon and stop uses its request boundary", 
     async close() {},
   };
   const secondAppServer: AppServerController = {
+    ...unusedTaskExecution,
     async startAndProbe() {
       secondProbeCalls += 1;
       return { state: "ready", codexVersion: "codex-cli second" };
@@ -119,6 +137,7 @@ test("a concurrent start waits behind the single daemon startup", async (t) => {
 
   const firstStart = startDaemon({
     appServer: {
+      ...unusedTaskExecution,
       async startAndProbe() {
         markFirstProbeEntered?.();
         await firstProbeCanFinish;
@@ -131,6 +150,7 @@ test("a concurrent start waits behind the single daemon startup", async (t) => {
   await firstProbeEntered;
   const secondStartPromise = startDaemon({
     appServer: {
+      ...unusedTaskExecution,
       async startAndProbe() {
         secondProbeCalls += 1;
         return { state: "ready", codexVersion: "codex-cli second" };
@@ -165,6 +185,7 @@ test("a replacement daemon waits for the previous App Server to close", async (t
   });
   const first = await startDaemon({
     appServer: {
+      ...unusedTaskExecution,
       async startAndProbe() {
         return { state: "ready", codexVersion: "codex-cli first" };
       },
@@ -183,6 +204,7 @@ test("a replacement daemon waits for the previous App Server to close", async (t
   let secondProbeCalls = 0;
   const secondStart = startDaemon({
     appServer: {
+      ...unusedTaskExecution,
       async startAndProbe() {
         secondProbeCalls += 1;
         return { state: "ready", codexVersion: "codex-cli second" };
@@ -212,6 +234,7 @@ test("daemon status preserves an unauthenticated startup result", async (t) => {
   t.after(() => rm(root, { recursive: true, force: true }));
   let closed = false;
   const appServer: AppServerController = {
+    ...unusedTaskExecution,
     async startAndProbe() {
       return {
         state: "unauthenticated",
@@ -244,6 +267,7 @@ test("daemon refuses missing App Server capabilities and reports the Codex versi
   const { root, paths } = await createTestEnvironment();
   t.after(() => rm(root, { recursive: true, force: true }));
   const appServer: AppServerController = {
+    ...unusedTaskExecution,
     async startAndProbe() {
       return {
         state: "incompatible",

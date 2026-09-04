@@ -1,23 +1,19 @@
 import {
-  access,
   chmod,
   lstat,
   mkdir,
   open,
   readFile,
-  realpath,
   rename,
-  stat,
   unlink,
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import path from "node:path";
 
 import type { DaemonPaths } from "./paths.js";
-import { StateStore, type QueueSnapshot, type QueuedTask } from "./state-store.js";
+import { StateStore, type QueueSnapshot } from "./state-store.js";
+import { handleTaskRequest, TaskService } from "./task-service.js";
 
 export interface Clock {
   now(): Date;
@@ -25,9 +21,9 @@ export interface Clock {
 
 export interface AppServerController {
   startAndProbe(): Promise<AppServerProbeResult>;
-  startThread?(workspace: string): Promise<{ threadId: string }>;
-  startTurn?(threadId: string, prompt: string): Promise<{ turnId: string }>;
-  onTurnCompleted?(listener: (turn: CompletedTurn) => void): () => void;
+  startThread(workspace: string): Promise<{ threadId: string }>;
+  startTurn(threadId: string, prompt: string): Promise<{ turnId: string }>;
+  onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void;
   close(): Promise<void>;
 }
 
@@ -139,7 +135,7 @@ export async function startDaemon({
       throw error;
     }
     const taskService = new TaskService(appServer, store, clock);
-    const unsubscribe = appServer.onTurnCompleted?.((turn) => {
+    const unsubscribe = appServer.onTurnCompleted((turn) => {
       taskService.handleTurnCompleted(turn);
     });
     let closing: Promise<void> | undefined;
@@ -462,105 +458,6 @@ async function requestResult(
   const response = await sendRequest(socketPath, request);
   if (typeof response.error === "string") throw new Error(response.error);
   return response.result;
-}
-
-class TaskService {
-  constructor(
-    private readonly appServer: AppServerController,
-    private readonly store: StateStore,
-    private readonly clock: Clock,
-  ) {}
-
-  async add(workspace: string, prompt: string): Promise<{ taskId: number }> {
-    if (prompt.trim().length === 0) throw new Error("Task prompt must not be empty.");
-    const normalizedWorkspace = await accessibleWorkspace(workspace);
-    return {
-      taskId: this.store.addWorkspaceTask(
-        normalizedWorkspace,
-        prompt,
-        this.clock.now(),
-      ),
-    };
-  }
-
-  async start(): Promise<{ state: "started" | "already-running" | "idle" }> {
-    const startThread = this.appServer.startThread?.bind(this.appServer);
-    const startTurn = this.appServer.startTurn?.bind(this.appServer);
-    if (!startThread || !startTurn) {
-      throw new Error("Codex App Server cannot start Tasks.");
-    }
-
-    const next = this.store.startNextTask(this.clock.now());
-    if (next.kind !== "started") return { state: next.kind };
-    try {
-      await accessibleWorkspace(next.task.workspace);
-    } catch (error) {
-      this.store.releaseTaskBeforeDispatch(next.task.id, this.clock.now());
-      throw error;
-    }
-    await this.dispatch(next.task, startThread, startTurn);
-    return { state: "started" };
-  }
-
-  snapshot(): QueueSnapshot {
-    return this.store.snapshot();
-  }
-
-  handleTurnCompleted(turn: CompletedTurn): void {
-    if (turn.status !== "completed") return;
-    this.store.completeTurn(turn.threadId, turn.turnId, this.clock.now());
-  }
-
-  async dispatch(
-    task: QueuedTask,
-    startThread: (workspace: string) => Promise<{ threadId: string }>,
-    startTurn: (threadId: string, prompt: string) => Promise<{ turnId: string }>,
-  ): Promise<void> {
-    const { threadId } = await startThread(task.workspace);
-    this.store.recordManagedThread(task, threadId, this.clock.now());
-    const { turnId } = await startTurn(threadId, task.prompt);
-    this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
-  }
-}
-
-async function handleTaskRequest(
-  request: Record<string, unknown>,
-  taskService: TaskService,
-): Promise<unknown> {
-  switch (request.method) {
-    case "task/add": {
-      if (
-        !isRecord(request.params)
-        || typeof request.params.workspace !== "string"
-        || typeof request.params.prompt !== "string"
-      ) {
-        throw new Error("task/add requires a Workspace and prompt.");
-      }
-      return taskService.add(request.params.workspace, request.params.prompt);
-    }
-    case "queue/start":
-      return taskService.start();
-    case "queue/status":
-      return taskService.snapshot();
-    default:
-      throw new Error("unknown daemon request");
-  }
-}
-
-async function accessibleWorkspace(workspace: string): Promise<string> {
-  const absoluteWorkspace = path.resolve(workspace);
-  try {
-    const canonicalWorkspace = await realpath(absoluteWorkspace);
-    const metadata = await stat(canonicalWorkspace);
-    if (!metadata.isDirectory()) throw new Error("not a directory");
-    await access(
-      canonicalWorkspace,
-      fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK,
-    );
-    return canonicalWorkspace;
-  } catch {
-    throw new Error(`Workspace is not an accessible directory: ${absoluteWorkspace}`);
-  }
 }
 
 function isQueueSnapshot(value: unknown): value is QueueSnapshot {

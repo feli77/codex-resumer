@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import Database from "better-sqlite3";
@@ -12,12 +12,16 @@ import { createFakeCodex } from "./fake-codex.js";
 
 const execFileAsync = promisify(execFile);
 const cliPath = path.resolve(new URL("../src/cli.js", import.meta.url).pathname);
+type FakeCodexOptions = NonNullable<Parameters<typeof createFakeCodex>[1]>;
 
-test("a Workspace Task runs once and completes without an output marker", async (t) => {
+async function createCliTestEnvironment(
+  t: TestContext,
+  fakeCodexOptions: FakeCodexOptions = {},
+) {
   const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-task-test-"));
   const workspace = path.join(root, "workspace");
   await mkdir(workspace);
-  const fakeCodex = await createFakeCodex(root);
+  const fakeCodex = await createFakeCodex(root, fakeCodexOptions);
   const stateDir = path.join(root, "state");
   const env = {
     ...process.env,
@@ -40,6 +44,13 @@ test("a Workspace Task runs once and completes without an output marker", async 
   t.after(async () => {
     await runCli("daemon", "stop").catch(() => undefined);
     await rm(root, { recursive: true, force: true });
+  });
+  return { fakeCodex, root, runCli, stateDir, workspace };
+}
+
+test("a Workspace Task runs once and completes without an output marker", async (t) => {
+  const { fakeCodex, runCli, stateDir, workspace } = await createCliTestEnvironment(t, {
+    completeTurnSynchronously: true,
   });
 
   assert.match(await runCli("daemon", "start"), /Daemon started/);
@@ -106,110 +117,39 @@ test("a Workspace Task runs once and completes without an output marker", async 
     database.prepare("SELECT id, task_id, state FROM turns").get(),
     { id: "turn-fake", task_id: 1, state: "completed" },
   );
+  assert.deepEqual(
+    database.prepare("SELECT id, workspace, state FROM managed_threads").get(),
+    { id: "thread-fake", workspace, state: "idle" },
+  );
+  assert.deepEqual(database.prepare("SELECT state FROM queue").get(), {
+    state: "running",
+  });
 });
 
 test("task add rejects a missing Workspace before a Turn can start", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-task-test-"));
-  const fakeCodex = await createFakeCodex(root);
-  const env = {
-    ...process.env,
-    HOME: root,
-    PATH: `${root}:${process.env.PATH ?? ""}`,
-    FAKE_CODEX_LOG: fakeCodex.logPath,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  };
-  const runCli = (...args: string[]) => execFileAsync(process.execPath, [cliPath, ...args], {
-    encoding: "utf8",
-    env,
-    timeout: 10_000,
-  });
-  t.after(async () => {
-    await runCli("daemon", "stop").catch(() => undefined);
-    await rm(root, { recursive: true, force: true });
-  });
+  const { fakeCodex, root, runCli } = await createCliTestEnvironment(t);
 
   await runCli("daemon", "start");
-  const missingWorkspace = path.join(root, "missing");
   await assert.rejects(
-    runCli("task", "add", "--workspace", missingWorkspace, "Do work"),
-    (error: unknown) => {
-      assert.ok(error instanceof Error && "stderr" in error);
-      assert.match(String(error.stderr), /Workspace is not an accessible directory/);
-      return true;
-    },
+    runCli("task", "add", "--workspace", path.join(root, "missing"), "Do work"),
+    workspaceError,
   );
-
-  const log = await readFile(fakeCodex.logPath, "utf8");
-  assert.doesNotMatch(log, /"method":"turn\/start"/);
+  assert.doesNotMatch(await readFile(fakeCodex.logPath, "utf8"), /"method":"turn\/start"/);
 });
 
 test("queue start rechecks a Workspace that became unavailable", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-task-test-"));
-  const workspace = path.join(root, "workspace");
-  await mkdir(workspace);
-  const fakeCodex = await createFakeCodex(root);
-  const env = {
-    ...process.env,
-    HOME: root,
-    PATH: `${root}:${process.env.PATH ?? ""}`,
-    FAKE_CODEX_LOG: fakeCodex.logPath,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  };
-  const runCli = (...args: string[]) => execFileAsync(process.execPath, [cliPath, ...args], {
-    encoding: "utf8",
-    env,
-    timeout: 10_000,
-  });
-  t.after(async () => {
-    await runCli("daemon", "stop").catch(() => undefined);
-    await rm(root, { recursive: true, force: true });
-  });
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t);
 
   await runCli("daemon", "start");
   await runCli("task", "add", "--workspace", workspace, "Do work");
   await rm(workspace, { recursive: true });
-  await assert.rejects(
-    runCli("queue", "start"),
-    (error: unknown) => {
-      assert.ok(error instanceof Error && "stderr" in error);
-      assert.match(String(error.stderr), /Workspace is not an accessible directory/);
-      return true;
-    },
-  );
-
-  const log = await readFile(fakeCodex.logPath, "utf8");
-  assert.doesNotMatch(log, /"method":"turn\/start"/);
+  await assert.rejects(runCli("queue", "start"), workspaceError);
+  assert.doesNotMatch(await readFile(fakeCodex.logPath, "utf8"), /"method":"turn\/start"/);
 });
 
 test("starting the Queue again does not dispatch another Turn", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-task-test-"));
-  const workspace = path.join(root, "workspace");
-  await mkdir(workspace);
-  const fakeCodex = await createFakeCodex(root, { completeTurn: false });
-  const env = {
-    ...process.env,
-    HOME: root,
-    PATH: `${root}:${process.env.PATH ?? ""}`,
-    FAKE_CODEX_LOG: fakeCodex.logPath,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  };
-  const runCli = async (...args: string[]): Promise<string> => {
-    const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], {
-      encoding: "utf8",
-      env,
-      timeout: 10_000,
-    });
-    return stdout;
-  };
-  t.after(async () => {
-    await runCli("daemon", "stop").catch(() => undefined);
-    await rm(root, { recursive: true, force: true });
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurn: false,
   });
 
   await runCli("daemon", "start");
@@ -224,9 +164,15 @@ test("starting the Queue again does not dispatch another Turn", async (t) => {
   const records = (await readFile(fakeCodex.logPath, "utf8"))
     .trim()
     .split("\n")
-    .map((line) => JSON.parse(line) as { type: string; message?: { method?: string } });
+    .map((line) => JSON.parse(line) as { message?: { method?: string } });
   assert.equal(
     records.filter((record) => record.message?.method === "turn/start").length,
     1,
   );
 });
+
+function workspaceError(error: unknown): boolean {
+  assert.ok(error instanceof Error && "stderr" in error);
+  assert.match(String(error.stderr), /Workspace is not an accessible directory/);
+  return true;
+}
