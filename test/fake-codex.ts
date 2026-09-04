@@ -3,7 +3,9 @@ import path from "node:path";
 
 interface FakeCodexOptions {
   authenticated?: boolean;
+  authRpcError?: boolean;
   omitClientRequest?: string;
+  omitRateLimitResetTime?: boolean;
 }
 
 export async function createFakeCodex(
@@ -68,12 +70,149 @@ if (args[0] === "app-server" && args[1] === "generate-json-schema") {
     "item/tool/requestUserInput",
     "mcpServer/elicitation/request",
   ])));
-  writeFileSync(path.join(out, "v2", "ErrorNotification.json"), JSON.stringify({
-    definitions: { CodexErrorInfo: { enum: ["usageLimitExceeded"] } },
-  }));
-  writeFileSync(path.join(out, "v2", "TurnCompletedNotification.json"), JSON.stringify({
-    definitions: { TurnStatus: { enum: ["inProgress", "completed", "interrupted", "failed"] } },
-  }));
+  const properties = (...names) => Object.fromEntries(names.map((name) => [name, {}]));
+  const turnDefinitions = {
+    Turn: {
+      properties: properties("id", "status", "error", "items"),
+      required: ["id", "status", "items"],
+    },
+    TurnStatus: { enum: ["inProgress", "completed", "interrupted", "failed"] },
+  };
+  const threadDefinitions = {
+    ...turnDefinitions,
+    Thread: {
+      properties: properties("id", "status", "turns"),
+      required: ["id", "status", "turns"],
+    },
+  };
+  const rateLimitDefinitions = {
+    RateLimitSnapshot: {
+      properties: properties("primary", "secondary", "rateLimitReachedType"),
+    },
+    RateLimitWindow: {
+      properties: properties("usedPercent", "windowDurationMins", "resetsAt"),
+      required: ["usedPercent"],
+    },
+  };
+  const schemaFiles = {
+    "v2/GetAccountRateLimitsResponse.json": {
+      properties: properties("rateLimits", "rateLimitsByLimitId"),
+      required: ["rateLimits"],
+      definitions: rateLimitDefinitions,
+    },
+    "v2/AccountRateLimitsUpdatedNotification.json": {
+      properties: properties("rateLimits"),
+      required: ["rateLimits"],
+      definitions: rateLimitDefinitions,
+    },
+    "v2/ErrorNotification.json": {
+      properties: properties("error", "threadId", "turnId", "willRetry"),
+      required: ["error", "threadId", "turnId", "willRetry"],
+      definitions: { CodexErrorInfo: { enum: ["usageLimitExceeded", "unauthorized"] } },
+    },
+    "v2/ThreadStartParams.json": {
+      properties: properties("cwd", "approvalPolicy", "sandbox"),
+    },
+    "v2/ThreadResumeParams.json": {
+      properties: properties("threadId"),
+      required: ["threadId"],
+    },
+    "v2/ThreadReadParams.json": {
+      properties: properties("threadId", "includeTurns"),
+      required: ["threadId"],
+    },
+    "v2/ThreadStartResponse.json": {
+      properties: properties("thread"),
+      required: ["thread"],
+      definitions: threadDefinitions,
+    },
+    "v2/ThreadResumeResponse.json": {
+      properties: properties("thread"),
+      required: ["thread"],
+      definitions: threadDefinitions,
+    },
+    "v2/ThreadReadResponse.json": {
+      properties: properties("thread"),
+      required: ["thread"],
+      definitions: threadDefinitions,
+    },
+    "v2/TurnStartParams.json": {
+      properties: properties("threadId", "input", "approvalPolicy", "sandboxPolicy"),
+      required: ["threadId", "input"],
+    },
+    "v2/TurnInterruptParams.json": {
+      properties: properties("threadId", "turnId"),
+      required: ["threadId", "turnId"],
+    },
+    "v2/TurnStartResponse.json": {
+      properties: properties("turn"),
+      required: ["turn"],
+      definitions: turnDefinitions,
+    },
+    "v2/TurnStartedNotification.json": {
+      properties: properties("threadId", "turn"),
+      required: ["threadId", "turn"],
+      definitions: turnDefinitions,
+    },
+    "v2/TurnCompletedNotification.json": {
+      properties: properties("threadId", "turn"),
+      required: ["threadId", "turn"],
+      definitions: turnDefinitions,
+    },
+    "CommandExecutionRequestApprovalParams.json": {
+      properties: properties("itemId", "threadId", "turnId"),
+      required: ["itemId", "threadId", "turnId"],
+    },
+    "CommandExecutionRequestApprovalResponse.json": {
+      properties: properties("decision"),
+      required: ["decision"],
+      enum: ["decline", "cancel"],
+    },
+    "FileChangeRequestApprovalParams.json": {
+      properties: properties("itemId", "threadId", "turnId"),
+      required: ["itemId", "threadId", "turnId"],
+    },
+    "FileChangeRequestApprovalResponse.json": {
+      properties: properties("decision"),
+      required: ["decision"],
+      enum: ["decline", "cancel"],
+    },
+    "PermissionsRequestApprovalParams.json": {
+      properties: properties("itemId", "threadId", "turnId", "permissions"),
+      required: ["itemId", "threadId", "turnId", "permissions"],
+    },
+    "PermissionsRequestApprovalResponse.json": {
+      properties: properties("permissions"),
+      required: ["permissions"],
+    },
+    "ToolRequestUserInputParams.json": {
+      properties: properties("itemId", "threadId", "turnId", "questions"),
+      required: ["itemId", "threadId", "turnId", "questions"],
+    },
+    "ToolRequestUserInputResponse.json": {
+      properties: properties("answers"),
+      required: ["answers"],
+    },
+    "McpServerElicitationRequestParams.json": {
+      properties: properties("serverName", "threadId", "turnId"),
+      required: ["serverName", "threadId"],
+      enum: ["form", "url"],
+    },
+    "McpServerElicitationRequestResponse.json": {
+      properties: properties("action", "content"),
+      required: ["action"],
+      enum: ["decline", "cancel"],
+    },
+  };
+  if (${String(options.omitRateLimitResetTime === true)}) {
+    delete schemaFiles["v2/GetAccountRateLimitsResponse.json"]
+      .definitions.RateLimitWindow.properties.resetsAt;
+  }
+  for (const [relativePath, schema] of Object.entries(schemaFiles)) {
+    const target = path.join(out, relativePath);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, JSON.stringify(schema));
+  }
   process.exit(0);
 }
 
@@ -91,10 +230,18 @@ lines.on("line", (line) => {
       userAgent: "fake-codex",
     } }));
   } else if (message.method === "account/read") {
-    console.log(JSON.stringify({ id: message.id, result: {
-      account: ${JSON.stringify(account)},
-      requiresOpenaiAuth: true,
-    } }));
+    if (${String(options.authRpcError === true)}) {
+      console.log(JSON.stringify({ id: message.id, error: {
+        code: -32000,
+        message: "authentication failed",
+        data: { codexErrorInfo: "unauthorized" },
+      } }));
+    } else {
+      console.log(JSON.stringify({ id: message.id, result: {
+        account: ${JSON.stringify(account)},
+        requiresOpenaiAuth: true,
+      } }));
+    }
   } else if (message.method === "account/rateLimits/read") {
     console.log(JSON.stringify({ id: message.id, result: {
       rateLimits: null,

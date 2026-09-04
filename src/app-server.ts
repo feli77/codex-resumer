@@ -47,6 +47,143 @@ const requiredTurnStatuses = [
   "failed",
 ] as const;
 
+interface SchemaObjectContract {
+  definition?: string;
+  literals?: readonly string[];
+  properties?: readonly string[];
+  required?: readonly string[];
+}
+
+interface SchemaFileContract {
+  capability: string;
+  file: string;
+  objects: readonly SchemaObjectContract[];
+}
+
+const schemaFileContracts: readonly SchemaFileContract[] = [
+  {
+    capability: "payload:account/rateLimits/read",
+    file: "v2/GetAccountRateLimitsResponse.json",
+    objects: [
+      { properties: ["rateLimits", "rateLimitsByLimitId"], required: ["rateLimits"] },
+      {
+        definition: "RateLimitSnapshot",
+        properties: ["primary", "secondary", "rateLimitReachedType"],
+      },
+      {
+        definition: "RateLimitWindow",
+        properties: ["usedPercent", "windowDurationMins", "resetsAt"],
+        required: ["usedPercent"],
+      },
+    ],
+  },
+  {
+    capability: "payload:account/rateLimits/updated",
+    file: "v2/AccountRateLimitsUpdatedNotification.json",
+    objects: [
+      { properties: ["rateLimits"], required: ["rateLimits"] },
+      {
+        definition: "RateLimitSnapshot",
+        properties: ["primary", "secondary", "rateLimitReachedType"],
+      },
+      {
+        definition: "RateLimitWindow",
+        properties: ["usedPercent", "windowDurationMins", "resetsAt"],
+      },
+    ],
+  },
+  {
+    capability: "payload:error",
+    file: "v2/ErrorNotification.json",
+    objects: [{
+      properties: ["error", "threadId", "turnId", "willRetry"],
+      required: ["error", "threadId", "turnId", "willRetry"],
+      literals: ["usageLimitExceeded", "unauthorized"],
+    }],
+  },
+  {
+    capability: "payload:thread/start-request",
+    file: "v2/ThreadStartParams.json",
+    objects: [{ properties: ["cwd", "approvalPolicy", "sandbox"] }],
+  },
+  {
+    capability: "payload:thread/resume-request",
+    file: "v2/ThreadResumeParams.json",
+    objects: [{ properties: ["threadId"], required: ["threadId"] }],
+  },
+  {
+    capability: "payload:thread/read-request",
+    file: "v2/ThreadReadParams.json",
+    objects: [{ properties: ["threadId", "includeTurns"], required: ["threadId"] }],
+  },
+  threadResponseContract("start", "v2/ThreadStartResponse.json"),
+  threadResponseContract("resume", "v2/ThreadResumeResponse.json"),
+  threadResponseContract("read", "v2/ThreadReadResponse.json"),
+  {
+    capability: "payload:turn/start-request",
+    file: "v2/TurnStartParams.json",
+    objects: [{
+      properties: ["threadId", "input", "approvalPolicy", "sandboxPolicy"],
+      required: ["threadId", "input"],
+    }],
+  },
+  {
+    capability: "payload:turn/interrupt-request",
+    file: "v2/TurnInterruptParams.json",
+    objects: [{
+      properties: ["threadId", "turnId"],
+      required: ["threadId", "turnId"],
+    }],
+  },
+  turnContract("start", "v2/TurnStartResponse.json", false),
+  turnContract("started", "v2/TurnStartedNotification.json", true),
+  turnContract("completed", "v2/TurnCompletedNotification.json", true),
+  ...approvalContract(
+    "item/commandExecution/requestApproval",
+    "CommandExecutionRequestApprovalParams.json",
+    "CommandExecutionRequestApprovalResponse.json",
+    "decision",
+    ["decline", "cancel"],
+  ),
+  ...approvalContract(
+    "item/fileChange/requestApproval",
+    "FileChangeRequestApprovalParams.json",
+    "FileChangeRequestApprovalResponse.json",
+    "decision",
+    ["decline", "cancel"],
+  ),
+  ...approvalContract(
+    "item/permissions/requestApproval",
+    "PermissionsRequestApprovalParams.json",
+    "PermissionsRequestApprovalResponse.json",
+    "permissions",
+  ),
+  ...approvalContract(
+    "item/tool/requestUserInput",
+    "ToolRequestUserInputParams.json",
+    "ToolRequestUserInputResponse.json",
+    "answers",
+  ),
+  {
+    capability: "payload:mcpServer/elicitation/request",
+    file: "McpServerElicitationRequestParams.json",
+    objects: [{
+      properties: ["serverName", "threadId", "turnId"],
+      required: ["serverName", "threadId"],
+      literals: ["form", "url"],
+    }],
+  },
+  {
+    capability: "payload:mcpServer/elicitation/response",
+    file: "McpServerElicitationRequestResponse.json",
+    objects: [{
+      properties: ["action", "content"],
+      required: ["action"],
+      literals: ["decline", "cancel"],
+    }],
+  },
+];
+
 interface CodexAppServerOptions {
   command?: string;
   env?: NodeJS.ProcessEnv;
@@ -57,6 +194,16 @@ interface PendingRequest {
   reject(error: Error): void;
   resolve(value: unknown): void;
   timeout: NodeJS.Timeout;
+}
+
+class AppServerRpcError extends Error {
+  constructor(
+    readonly code: number | undefined,
+    readonly data: unknown,
+  ) {
+    super("Codex App Server rejected a startup request");
+    this.name = "AppServerRpcError";
+  }
 }
 
 export class CodexAppServer implements AppServerController {
@@ -116,18 +263,29 @@ export class CodexAppServer implements AppServerController {
       });
       this.#notify("initialized", {});
 
-      const accountResult = await this.#request("account/read", {
-        refreshToken: false,
-      });
+      let accountResult: unknown;
+      try {
+        accountResult = await this.#request("account/read", {
+          refreshToken: false,
+        });
+      } catch (error) {
+        if (isAuthenticationError(error)) {
+          return unauthenticated(codexVersion);
+        }
+        throw error;
+      }
       if (!hasChatGptAccount(accountResult)) {
-        return {
-          state: "unauthenticated",
-          codexVersion,
-          message: "ChatGPT authentication required; run `codex login`.",
-        };
+        return unauthenticated(codexVersion);
       }
 
-      await this.#request("account/rateLimits/read");
+      try {
+        await this.#request("account/rateLimits/read");
+      } catch (error) {
+        if (isAuthenticationError(error)) {
+          return unauthenticated(codexVersion);
+        }
+        throw error;
+      }
       return { state: "ready", codexVersion };
     } catch {
       await this.close();
@@ -177,13 +335,11 @@ export class CodexAppServer implements AppServerController {
         { encoding: "utf8", env: this.#env, timeout: 10_000 },
       );
 
-      const [clientSchema, notificationSchema, requestSchema, errorSchema, turnSchema] =
+      const [clientSchema, notificationSchema, requestSchema] =
         await Promise.all([
           readJson(path.join(schemaDirectory, "ClientRequest.json")),
           readJson(path.join(schemaDirectory, "ServerNotification.json")),
           readJson(path.join(schemaDirectory, "ServerRequest.json")),
-          readJson(path.join(schemaDirectory, "v2", "ErrorNotification.json")),
-          readJson(path.join(schemaDirectory, "v2", "TurnCompletedNotification.json")),
         ]);
 
       const clientRequests = collectMethods(clientSchema);
@@ -200,12 +356,7 @@ export class CodexAppServer implements AppServerController {
       for (const method of requiredServerRequests) {
         if (!serverRequests.has(method)) missing.push(`server-request:${method}`);
       }
-      if (!containsLiteral(errorSchema, "usageLimitExceeded")) {
-        missing.push("error-code:usageLimitExceeded");
-      }
-      for (const status of requiredTurnStatuses) {
-        if (!containsLiteral(turnSchema, status)) missing.push(`turn-status:${status}`);
-      }
+      missing.push(...await missingSchemaContracts(schemaDirectory));
       return missing;
     } finally {
       await rm(schemaDirectory, { recursive: true, force: true });
@@ -272,7 +423,11 @@ export class CodexAppServer implements AppServerController {
     clearTimeout(pending.timeout);
     this.#pending.delete(message.id);
     if (message.error !== undefined) {
-      pending.reject(new Error("Codex App Server rejected a startup request"));
+      const rpcError = isRecord(message.error) ? message.error : {};
+      pending.reject(new AppServerRpcError(
+        typeof rpcError.code === "number" ? rpcError.code : undefined,
+        rpcError.data,
+      ));
     } else {
       pending.resolve(message.result);
     }
@@ -293,6 +448,134 @@ function incompatible(
   message: string,
 ): Extract<AppServerProbeResult, { state: "incompatible" }> {
   return { state: "incompatible", codexVersion, missingCapabilities, message };
+}
+
+function unauthenticated(
+  codexVersion: string,
+): Extract<AppServerProbeResult, { state: "unauthenticated" }> {
+  return {
+    state: "unauthenticated",
+    codexVersion,
+    message: "ChatGPT authentication required; run `codex login`.",
+  };
+}
+
+function isAuthenticationError(error: unknown): boolean {
+  return error instanceof AppServerRpcError
+    && (error.code === 401 || containsLiteral(error.data, "unauthorized"));
+}
+
+function threadResponseContract(
+  method: "start" | "resume" | "read",
+  file: string,
+): SchemaFileContract {
+  return {
+    capability: `payload:thread/${method}-response`,
+    file,
+    objects: [
+      { properties: ["thread"], required: ["thread"] },
+      {
+        definition: "Thread",
+        properties: ["id", "status", "turns"],
+        required: ["id", "status", "turns"],
+      },
+      {
+        definition: "Turn",
+        properties: ["id", "status", "error"],
+        required: ["id", "status"],
+      },
+    ],
+  };
+}
+
+function turnContract(
+  method: "start" | "started" | "completed",
+  file: string,
+  includesThreadId: boolean,
+): SchemaFileContract {
+  return {
+    capability: `payload:turn/${method}`,
+    file,
+    objects: [
+      {
+        properties: includesThreadId ? ["threadId", "turn"] : ["turn"],
+        required: includesThreadId ? ["threadId", "turn"] : ["turn"],
+      },
+      {
+        definition: "Turn",
+        properties: ["id", "status", "error"],
+        required: ["id", "status"],
+      },
+      { definition: "TurnStatus", literals: requiredTurnStatuses },
+    ],
+  };
+}
+
+function approvalContract(
+  method: string,
+  paramsFile: string,
+  responseFile: string,
+  responseProperty: string,
+  responseLiterals: readonly string[] = [],
+): readonly SchemaFileContract[] {
+  return [
+    {
+      capability: `payload:${method}`,
+      file: paramsFile,
+      objects: [{
+        properties: ["itemId", "threadId", "turnId"],
+        required: ["itemId", "threadId", "turnId"],
+      }],
+    },
+    {
+      capability: `payload:${method}-response`,
+      file: responseFile,
+      objects: [{
+        properties: [responseProperty],
+        required: [responseProperty],
+        literals: responseLiterals,
+      }],
+    },
+  ];
+}
+
+async function missingSchemaContracts(schemaDirectory: string): Promise<string[]> {
+  const results = await Promise.all(schemaFileContracts.map(async (contract) => {
+    try {
+      const schema = await readJson(path.join(schemaDirectory, contract.file));
+      return contract.objects.every((objectContract) =>
+        matchesObjectContract(schema, objectContract)
+      ) ? undefined : contract.capability;
+    } catch {
+      return contract.capability;
+    }
+  }));
+  return results.filter((result): result is string => result !== undefined);
+}
+
+function matchesObjectContract(
+  schema: unknown,
+  contract: SchemaObjectContract,
+): boolean {
+  let target = schema;
+  if (contract.definition) {
+    if (!isRecord(schema) || !isRecord(schema.definitions)) return false;
+    target = schema.definitions[contract.definition];
+  }
+  if (!isRecord(target)) return false;
+
+  if (contract.properties) {
+    const properties = target.properties;
+    if (!isRecord(properties)) return false;
+    if (!contract.properties.every((property) => property in properties)) return false;
+  }
+  if (contract.required) {
+    const required = target.required;
+    if (!Array.isArray(required)) return false;
+    if (!contract.required.every((property) => required.includes(property))) return false;
+  }
+  return !contract.literals
+    || contract.literals.every((literal) => containsLiteral(target, literal));
 }
 
 function hasChatGptAccount(result: unknown): boolean {

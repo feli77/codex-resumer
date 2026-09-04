@@ -14,28 +14,28 @@ import {
 import { resolvePaths } from "../src/paths.js";
 import { createFakeCodex } from "./fake-codex.js";
 
-test("daemon status reports stopped before the daemon has started", async (t) => {
+async function createTestEnvironment() {
   const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  return {
+    root,
+    paths: resolvePaths({
+      HOME: root,
+      XDG_CONFIG_HOME: path.join(root, "config"),
+      XDG_RUNTIME_DIR: path.join(root, "runtime"),
+      XDG_STATE_HOME: path.join(root, "state"),
+    }),
+  };
+}
 
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
+test("daemon status reports stopped before the daemon has started", async (t) => {
+  const { root, paths } = await createTestEnvironment();
+  t.after(() => rm(root, { recursive: true, force: true }));
 
   assert.deepEqual(await getDaemonStatus(paths), { state: "stopped" });
 });
 
 test("daemon status crosses the private socket boundary", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
+  const { root, paths } = await createTestEnvironment();
   const appServer: AppServerController = {
     async startAndProbe() {
       return { state: "ready", codexVersion: "codex-cli 0.test" };
@@ -69,13 +69,7 @@ test("daemon status crosses the private socket boundary", async (t) => {
 });
 
 test("repeated start keeps a single daemon and stop uses its request boundary", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
+  const { root, paths } = await createTestEnvironment();
   let firstProbeCalls = 0;
   let secondProbeCalls = 0;
   const firstAppServer: AppServerController = {
@@ -112,13 +106,7 @@ test("repeated start keeps a single daemon and stop uses its request boundary", 
 });
 
 test("a concurrent start waits behind the single daemon startup", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
+  const { root, paths } = await createTestEnvironment();
   let releaseFirstProbe: (() => void) | undefined;
   let markFirstProbeEntered: (() => void) | undefined;
   const firstProbeEntered = new Promise<void>((resolve) => {
@@ -141,7 +129,7 @@ test("a concurrent start waits behind the single daemon startup", async (t) => {
     paths,
   });
   await firstProbeEntered;
-  const secondStart = await startDaemon({
+  const secondStartPromise = startDaemon({
     appServer: {
       async startAndProbe() {
         secondProbeCalls += 1;
@@ -153,6 +141,7 @@ test("a concurrent start waits behind the single daemon startup", async (t) => {
   });
   releaseFirstProbe?.();
   const firstResult = await firstStart;
+  const secondStart = await secondStartPromise;
   t.after(async () => {
     if (firstResult.kind === "started") await firstResult.daemon.close();
     if (secondStart.kind === "started") await secondStart.daemon.close();
@@ -160,19 +149,67 @@ test("a concurrent start waits behind the single daemon startup", async (t) => {
   });
 
   assert.equal(firstResult.kind, "started");
-  assert.equal(secondStart.kind, "already-starting");
+  assert.equal(secondStart.kind, "already-running");
   assert.equal(secondProbeCalls, 0);
 });
 
-test("daemon status preserves an unauthenticated startup result", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
+test("a replacement daemon waits for the previous App Server to close", async (t) => {
+  const { root, paths } = await createTestEnvironment();
+  let markCloseEntered: (() => void) | undefined;
+  let allowClose: (() => void) | undefined;
+  const closeEntered = new Promise<void>((resolve) => {
+    markCloseEntered = resolve;
   });
+  const closeCanFinish = new Promise<void>((resolve) => {
+    allowClose = resolve;
+  });
+  const first = await startDaemon({
+    appServer: {
+      async startAndProbe() {
+        return { state: "ready", codexVersion: "codex-cli first" };
+      },
+      async close() {
+        markCloseEntered?.();
+        await closeCanFinish;
+      },
+    },
+    paths,
+  });
+  assert.equal(first.kind, "started");
+  if (first.kind !== "started") return;
+
+  const stopping = stopDaemon(paths);
+  await closeEntered;
+  let secondProbeCalls = 0;
+  const secondStart = startDaemon({
+    appServer: {
+      async startAndProbe() {
+        secondProbeCalls += 1;
+        return { state: "ready", codexVersion: "codex-cli second" };
+      },
+      async close() {},
+    },
+    paths,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const probeCallsBeforeCloseFinished = secondProbeCalls;
+  allowClose?.();
+  await stopping;
+  const second = await secondStart;
+  t.after(async () => {
+    await first.daemon.close();
+    if (second.kind === "started") await second.daemon.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  assert.equal(probeCallsBeforeCloseFinished, 0);
+  assert.equal(second.kind, "started");
+  assert.equal((await getDaemonStatus(paths)).state, "running");
+});
+
+test("daemon status preserves an unauthenticated startup result", async (t) => {
+  const { root, paths } = await createTestEnvironment();
+  t.after(() => rm(root, { recursive: true, force: true }));
   let closed = false;
   const appServer: AppServerController = {
     async startAndProbe() {
@@ -204,14 +241,8 @@ test("daemon status preserves an unauthenticated startup result", async (t) => {
 });
 
 test("daemon refuses missing App Server capabilities and reports the Codex version", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
+  const { root, paths } = await createTestEnvironment();
   t.after(() => rm(root, { recursive: true, force: true }));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
   const appServer: AppServerController = {
     async startAndProbe() {
       return {
@@ -241,13 +272,7 @@ test("daemon refuses missing App Server capabilities and reports the Codex versi
 });
 
 test("daemon probes the installed App Server protocol and current ChatGPT login", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
+  const { root, paths } = await createTestEnvironment();
   const fakeCodex = await createFakeCodex(root);
   let close: (() => Promise<void>) | undefined;
   t.after(async () => {
@@ -285,14 +310,8 @@ test("daemon probes the installed App Server protocol and current ChatGPT login"
 });
 
 test("installed protocol probe names a missing required capability", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
+  const { root, paths } = await createTestEnvironment();
   t.after(() => rm(root, { recursive: true, force: true }));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
-  });
   const fakeCodex = await createFakeCodex(root, {
     omitClientRequest: "turn/interrupt",
   });
@@ -315,15 +334,36 @@ test("installed protocol probe names a missing required capability", async (t) =
   });
 });
 
-test("live App Server probe reports a missing ChatGPT login", async (t) => {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const paths = resolvePaths({
-    HOME: root,
-    XDG_CONFIG_HOME: path.join(root, "config"),
-    XDG_RUNTIME_DIR: path.join(root, "runtime"),
-    XDG_STATE_HOME: path.join(root, "state"),
+test("installed protocol probe rejects a quota payload without reset times", async (t) => {
+  const { root, paths } = await createTestEnvironment();
+  let close: (() => Promise<void>) | undefined;
+  t.after(async () => {
+    await close?.();
+    await rm(root, { recursive: true, force: true });
   });
+  const fakeCodex = await createFakeCodex(root, {
+    omitRateLimitResetTime: true,
+  });
+
+  const result = await startDaemon({
+    appServer: new CodexAppServer({
+      command: fakeCodex.command,
+      env: { ...process.env, FAKE_CODEX_LOG: fakeCodex.logPath },
+    }),
+    paths,
+  });
+  if (result.kind === "started") close = result.daemon.close;
+
+  const status = await getDaemonStatus(paths);
+  assert.equal(status.state, "incompatible");
+  if (status.state !== "incompatible") return;
+  assert.equal(status.codexVersion, "codex-cli 9.fake");
+  assert.ok(status.missingCapabilities.includes("payload:account/rateLimits/read"));
+});
+
+test("live App Server probe reports a missing ChatGPT login", async (t) => {
+  const { root, paths } = await createTestEnvironment();
+  t.after(() => rm(root, { recursive: true, force: true }));
   const fakeCodex = await createFakeCodex(root, { authenticated: false });
 
   await startDaemon({
@@ -340,5 +380,27 @@ test("live App Server probe reports a missing ChatGPT login", async (t) => {
     codexVersion: "codex-cli 9.fake",
     message: "ChatGPT authentication required; run `codex login`.",
     checkedAt: "2026-09-04T05:06:07.000Z",
+  });
+});
+
+test("live App Server probe classifies a structured auth error as unauthenticated", async (t) => {
+  const { root, paths } = await createTestEnvironment();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fakeCodex = await createFakeCodex(root, { authRpcError: true });
+
+  await startDaemon({
+    appServer: new CodexAppServer({
+      command: fakeCodex.command,
+      env: { ...process.env, FAKE_CODEX_LOG: fakeCodex.logPath },
+    }),
+    clock: { now: () => new Date("2026-09-04T06:07:08.000Z") },
+    paths,
+  });
+
+  assert.deepEqual(await getDaemonStatus(paths), {
+    state: "unauthenticated",
+    codexVersion: "codex-cli 9.fake",
+    message: "ChatGPT authentication required; run `codex login`.",
+    checkedAt: "2026-09-04T06:07:08.000Z",
   });
 });

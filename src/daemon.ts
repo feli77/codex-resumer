@@ -84,13 +84,20 @@ export async function startDaemon({
   if (existing) return { kind: "already-running", status: existing };
 
   await preparePrivateDirectories(paths);
-  const startupLock = await acquireStartupLock(paths.lockPath);
-  if (!startupLock) return { kind: "already-starting" };
+  const lockResult = await acquireDaemonLock(paths);
+  if (!lockResult) return { kind: "already-starting" };
+  if ("status" in lockResult) {
+    return { kind: "already-running", status: lockResult.status };
+  }
+  const daemonLock = lockResult;
+  let lockOwnedByRunningDaemon = false;
 
   try {
-    const winner = await requestRunningStatus(paths);
-    if (winner) return { kind: "already-running", status: winner };
-    await removeStaleSocket(paths.socketPath);
+    const concurrentlyStartedDaemon = await requestRunningStatus(paths);
+    if (concurrentlyStartedDaemon) {
+      return { kind: "already-running", status: concurrentlyStartedDaemon };
+    }
+    await unlinkIfExists(paths.socketPath);
 
     const probe = await appServer.startAndProbe();
     if (probe.state !== "ready") {
@@ -111,7 +118,7 @@ export async function startDaemon({
     };
     let closing: Promise<void> | undefined;
     const close = (): Promise<void> => {
-      closing ??= closeDaemon(server, appServer, paths);
+      closing ??= closeDaemon(server, appServer, paths, daemonLock);
       return closing;
     };
     const server = createDaemonServer(status, () => {
@@ -130,9 +137,10 @@ export async function startDaemon({
     await chmod(paths.socketPath, 0o600);
     await writeStatus(paths.statusPath, status);
 
+    lockOwnedByRunningDaemon = true;
     return { kind: "started", daemon: { close } };
   } finally {
-    await startupLock.release();
+    if (!lockOwnedByRunningDaemon) await daemonLock.release();
   }
 }
 
@@ -178,22 +186,28 @@ interface StartupLock {
   release(): Promise<void>;
 }
 
-async function acquireStartupLock(lockPath: string): Promise<StartupLock | undefined> {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+async function acquireDaemonLock(
+  paths: DaemonPaths,
+): Promise<StartupLock | { status: Extract<DaemonStatus, { state: "running" }> } | undefined> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const running = await requestRunningStatus(paths);
+    if (running) return { status: running };
+
     try {
-      const handle = await open(lockPath, "wx", 0o600);
+      const handle = await open(paths.lockPath, "wx", 0o600);
       await handle.writeFile(`${process.pid}\n`, "utf8");
-      return lockHandle(handle, lockPath);
+      return lockHandle(handle, paths.lockPath);
     } catch (error) {
       if (!hasErrorCode(error, "EEXIST")) throw error;
-      if (await lockOwnerIsAlive(lockPath)) return undefined;
+      if (await lockOwnerIsAlive(paths.lockPath)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
+      }
 
-      const stalePath = `${lockPath}.stale-${process.pid}`;
+      const stalePath = `${paths.lockPath}.stale-${process.pid}`;
       try {
-        await rename(lockPath, stalePath);
-        await unlink(stalePath).catch((unlinkError: unknown) => {
-          if (!hasErrorCode(unlinkError, "ENOENT")) throw unlinkError;
-        });
+        await rename(paths.lockPath, stalePath);
+        await unlinkIfExists(stalePath);
       } catch (renameError) {
         if (!hasErrorCode(renameError, "ENOENT")) throw renameError;
       }
@@ -209,9 +223,7 @@ function lockHandle(handle: FileHandle, lockPath: string): StartupLock {
       if (released) return;
       released = true;
       await handle.close();
-      await unlink(lockPath).catch((error: unknown) => {
-        if (!hasErrorCode(error, "ENOENT")) throw error;
-      });
+      await unlinkIfExists(lockPath);
     },
   };
 }
@@ -295,13 +307,18 @@ async function closeDaemon(
   server: Server,
   appServer: AppServerController,
   paths: DaemonPaths,
+  daemonLock: StartupLock,
 ): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-  await appServer.close();
-  await removeStaleSocket(paths.socketPath);
-  await writeStatus(paths.statusPath, { state: "stopped" });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+    await appServer.close();
+    await unlinkIfExists(paths.socketPath);
+    await writeStatus(paths.statusPath, { state: "stopped" });
+  } finally {
+    await daemonLock.release();
+  }
 }
 
 async function requestRunningStatus(
@@ -409,12 +426,10 @@ async function writeStatus(statusPath: string, status: DaemonStatus): Promise<vo
   await chmod(statusPath, 0o600);
 }
 
-async function removeStaleSocket(socketPath: string): Promise<void> {
-  try {
-    await unlink(socketPath);
-  } catch (error) {
-    if (!isRecord(error) || error.code !== "ENOENT") throw error;
-  }
+async function unlinkIfExists(targetPath: string): Promise<void> {
+  await unlink(targetPath).catch((error: unknown) => {
+    if (!hasErrorCode(error, "ENOENT")) throw error;
+  });
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {
