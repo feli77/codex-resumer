@@ -10,6 +10,8 @@
 
 Issues and specs are tracked in GitHub Issues for `feli77/codex-resumer`. See `docs/agents/issue-tracker.md`.
 
+After implementing an issue, close it only when every acceptance criterion and required verification has passed. Post a final comment summarizing the implementation and verification evidence before closing. Close a parent issue only after all child issues and parent-level acceptance are complete.
+
 ### Triage labels
 
 Triage uses the five default canonical labels. See `docs/agents/triage-labels.md`.
