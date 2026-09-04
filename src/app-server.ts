@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import type {
   AppServerController,
   AppServerProbeResult,
+  CompletedTurn,
 } from "./daemon.js";
 
 const execFileAsync = promisify(execFile);
@@ -214,6 +215,7 @@ export class CodexAppServer implements AppServerController {
   #lineReader: ReadLineInterface | undefined;
   #nextRequestId = 0;
   #pending = new Map<number, PendingRequest>();
+  #turnCompletedListeners = new Set<(turn: CompletedTurn) => void>();
   #closePromise: Promise<void> | undefined;
 
   constructor(options: CodexAppServerOptions = {}) {
@@ -304,6 +306,30 @@ export class CodexAppServer implements AppServerController {
       child.kill("SIGTERM");
     });
     return this.#closePromise;
+  }
+
+  async startThread(workspace: string): Promise<{ threadId: string }> {
+    const result = await this.#request("thread/start", { cwd: workspace });
+    if (!isRecord(result) || !isRecord(result.thread) || typeof result.thread.id !== "string") {
+      throw new Error("Codex App Server returned an invalid Thread response");
+    }
+    return { threadId: result.thread.id };
+  }
+
+  async startTurn(threadId: string, prompt: string): Promise<{ turnId: string }> {
+    const result = await this.#request("turn/start", {
+      threadId,
+      input: [{ type: "text", text: prompt }],
+    });
+    if (!isRecord(result) || !isRecord(result.turn) || typeof result.turn.id !== "string") {
+      throw new Error("Codex App Server returned an invalid Turn response");
+    }
+    return { turnId: result.turn.id };
+  }
+
+  onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void {
+    this.#turnCompletedListeners.add(listener);
+    return () => this.#turnCompletedListeners.delete(listener);
   }
 
   async #readVersion(): Promise<string> {
@@ -408,7 +434,15 @@ export class CodexAppServer implements AppServerController {
       this.#rejectPending(new Error("Codex App Server returned invalid JSON"));
       return;
     }
-    if (!isRecord(message) || typeof message.id !== "number") return;
+    if (!isRecord(message)) return;
+    if (message.method === "turn/completed") {
+      const completed = parseCompletedTurn(message.params);
+      if (completed) {
+        for (const listener of this.#turnCompletedListeners) listener(completed);
+      }
+      return;
+    }
+    if (typeof message.id !== "number") return;
     const pending = this.#pending.get(message.id);
     if (!pending) return;
     clearTimeout(pending.timeout);
@@ -431,6 +465,18 @@ export class CodexAppServer implements AppServerController {
     }
     this.#pending.clear();
   }
+}
+
+function parseCompletedTurn(value: unknown): CompletedTurn | undefined {
+  if (!isRecord(value) || typeof value.threadId !== "string" || !isRecord(value.turn)) {
+    return undefined;
+  }
+  const { id, status } = value.turn;
+  if (typeof id !== "string") return undefined;
+  if (status !== "completed" && status !== "failed" && status !== "interrupted") {
+    return undefined;
+  }
+  return { threadId: value.threadId, turnId: id, status };
 }
 
 function incompatible(

@@ -4,6 +4,7 @@ import path from "node:path";
 interface FakeCodexOptions {
   authenticated?: boolean;
   authRpcError?: boolean;
+  completeTurn?: boolean;
   omitClientRequest?: string;
   omitRateLimitResetTime?: boolean;
 }
@@ -247,6 +248,21 @@ lines.on("line", (line) => {
       rateLimits: null,
       rateLimitsByLimitId: null,
     } }));
+  } else if (message.method === "thread/start") {
+    const thread = { id: "thread-fake", status: "idle", turns: [] };
+    console.log(JSON.stringify({ id: message.id, result: { thread } }));
+    console.log(JSON.stringify({ method: "thread/started", params: { thread } }));
+  } else if (message.method === "turn/start") {
+    const turn = { id: "turn-fake", status: "inProgress", items: [] };
+    console.log(JSON.stringify({ id: message.id, result: { turn } }));
+    if (${String(options.completeTurn !== false)}) {
+      setTimeout(() => {
+        console.log(JSON.stringify({ method: "turn/completed", params: {
+          threadId: message.params.threadId,
+          turn: { ...turn, status: "completed" },
+        } }));
+      }, 10);
+    }
   }
 });
 `;

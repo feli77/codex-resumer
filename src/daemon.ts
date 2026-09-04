@@ -1,17 +1,23 @@
 import {
+  access,
   chmod,
   lstat,
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
+  stat,
   unlink,
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import path from "node:path";
 
 import type { DaemonPaths } from "./paths.js";
+import { StateStore, type QueueSnapshot, type QueuedTask } from "./state-store.js";
 
 export interface Clock {
   now(): Date;
@@ -19,7 +25,16 @@ export interface Clock {
 
 export interface AppServerController {
   startAndProbe(): Promise<AppServerProbeResult>;
+  startThread?(workspace: string): Promise<{ threadId: string }>;
+  startTurn?(threadId: string, prompt: string): Promise<{ turnId: string }>;
+  onTurnCompleted?(listener: (turn: CompletedTurn) => void): () => void;
   close(): Promise<void>;
+}
+
+export interface CompletedTurn {
+  status: "completed" | "failed" | "interrupted";
+  threadId: string;
+  turnId: string;
 }
 
 export type AppServerProbeResult =
@@ -116,18 +131,38 @@ export async function startDaemon({
       codexVersion: probe.codexVersion,
       startedAt: clock.now().toISOString(),
     };
+    let store: StateStore;
+    try {
+      store = new StateStore(paths.databasePath);
+    } catch (error) {
+      await appServer.close();
+      throw error;
+    }
+    const taskService = new TaskService(appServer, store, clock);
+    const unsubscribe = appServer.onTurnCompleted?.((turn) => {
+      taskService.handleTurnCompleted(turn);
+    });
     let closing: Promise<void> | undefined;
     const close = (): Promise<void> => {
-      closing ??= closeDaemon(server, appServer, paths, daemonLock);
+      closing ??= closeDaemon(
+        server,
+        appServer,
+        paths,
+        daemonLock,
+        store,
+        unsubscribe,
+      );
       return closing;
     };
-    const server = createDaemonServer(status, () => {
+    const server = createDaemonServer(status, taskService, () => {
       void close();
     });
 
     try {
       await listen(server, paths.socketPath);
     } catch (error) {
+      unsubscribe?.();
+      store.close();
       await appServer.close();
       const runningWinner = await requestRunningStatus(paths);
       if (runningWinner) return { kind: "already-running", status: runningWinner };
@@ -142,6 +177,40 @@ export async function startDaemon({
   } finally {
     if (!lockOwnedByRunningDaemon) await daemonLock.release();
   }
+}
+
+export async function addWorkspaceTask(
+  paths: DaemonPaths,
+  workspace: string,
+  prompt: string,
+): Promise<number> {
+  const result = await requestResult(paths.socketPath, {
+    method: "task/add",
+    params: { workspace, prompt },
+  });
+  if (!isRecord(result) || typeof result.taskId !== "number") {
+    throw new Error("daemon returned an invalid Task result");
+  }
+  return result.taskId;
+}
+
+export async function startQueueRun(
+  paths: DaemonPaths,
+): Promise<"started" | "already-running" | "idle"> {
+  const result = await requestResult(paths.socketPath, { method: "queue/start" });
+  if (
+    !isRecord(result)
+    || (result.state !== "started" && result.state !== "already-running" && result.state !== "idle")
+  ) {
+    throw new Error("daemon returned an invalid Queue start result");
+  }
+  return result.state;
+}
+
+export async function getQueueStatus(paths: DaemonPaths): Promise<QueueSnapshot> {
+  const result = await requestResult(paths.socketPath, { method: "queue/status" });
+  if (!isQueueSnapshot(result)) throw new Error("daemon returned an invalid Queue status");
+  return result;
 }
 
 export async function getDaemonStatus(paths: DaemonPaths): Promise<DaemonStatus> {
@@ -260,31 +329,43 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 
 function createDaemonServer(
   status: Extract<DaemonStatus, { state: "running" }>,
+  taskService: TaskService,
   onStop: () => void,
 ): Server {
-  return createServer((socket) => handleConnection(socket, status, onStop));
+  return createServer((socket) => handleConnection(socket, status, taskService, onStop));
 }
 
 function handleConnection(
   socket: Socket,
   status: Extract<DaemonStatus, { state: "running" }>,
+  taskService: TaskService,
   onStop: () => void,
 ): void {
   let input = "";
+  let handled = false;
   socket.setEncoding("utf8");
   socket.on("data", (chunk: string) => {
     input += chunk;
     const newline = input.indexOf("\n");
-    if (newline === -1) return;
+    if (newline === -1 || handled) return;
+    handled = true;
 
     try {
-      const request = JSON.parse(input.slice(0, newline)) as { method?: unknown };
+      const request: unknown = JSON.parse(input.slice(0, newline));
+      if (!isRecord(request)) {
+        socket.end(`${JSON.stringify({ error: "invalid daemon request" })}\n`);
+        return;
+      }
       if (request.method === "status") {
         socket.end(`${JSON.stringify({ result: status })}\n`);
       } else if (request.method === "stop") {
         socket.end(`${JSON.stringify({ result: { state: "stopping" } })}\n`, onStop);
       } else {
-        socket.end(`${JSON.stringify({ error: "unknown daemon request" })}\n`);
+        void handleTaskRequest(request, taskService)
+          .then((result) => socket.end(`${JSON.stringify({ result })}\n`))
+          .catch((error: unknown) => {
+            socket.end(`${JSON.stringify({ error: errorMessage(error) })}\n`);
+          });
       }
     } catch {
       socket.end(`${JSON.stringify({ error: "invalid daemon request" })}\n`);
@@ -308,12 +389,16 @@ async function closeDaemon(
   appServer: AppServerController,
   paths: DaemonPaths,
   daemonLock: StartupLock,
+  store: StateStore,
+  unsubscribe: (() => void) | undefined,
 ): Promise<void> {
   try {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
+    unsubscribe?.();
     await appServer.close();
+    store.close();
     await unlinkIfExists(paths.socketPath);
     await writeStatus(paths.statusPath, { state: "stopped" });
   } finally {
@@ -334,7 +419,7 @@ async function requestRunningStatus(
 
 function sendRequest(
   socketPath: string,
-  request: { method: string },
+  request: { method: string; params?: unknown },
 ): Promise<{ result?: unknown; error?: unknown }> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
@@ -368,6 +453,133 @@ function sendRequest(
       });
     });
   });
+}
+
+async function requestResult(
+  socketPath: string,
+  request: { method: string; params?: unknown },
+): Promise<unknown> {
+  const response = await sendRequest(socketPath, request);
+  if (typeof response.error === "string") throw new Error(response.error);
+  return response.result;
+}
+
+class TaskService {
+  constructor(
+    private readonly appServer: AppServerController,
+    private readonly store: StateStore,
+    private readonly clock: Clock,
+  ) {}
+
+  async add(workspace: string, prompt: string): Promise<{ taskId: number }> {
+    if (prompt.trim().length === 0) throw new Error("Task prompt must not be empty.");
+    const normalizedWorkspace = await accessibleWorkspace(workspace);
+    return {
+      taskId: this.store.addWorkspaceTask(
+        normalizedWorkspace,
+        prompt,
+        this.clock.now(),
+      ),
+    };
+  }
+
+  async start(): Promise<{ state: "started" | "already-running" | "idle" }> {
+    const startThread = this.appServer.startThread?.bind(this.appServer);
+    const startTurn = this.appServer.startTurn?.bind(this.appServer);
+    if (!startThread || !startTurn) {
+      throw new Error("Codex App Server cannot start Tasks.");
+    }
+
+    const next = this.store.startNextTask(this.clock.now());
+    if (next.kind !== "started") return { state: next.kind };
+    try {
+      await accessibleWorkspace(next.task.workspace);
+    } catch (error) {
+      this.store.releaseTaskBeforeDispatch(next.task.id, this.clock.now());
+      throw error;
+    }
+    await this.dispatch(next.task, startThread, startTurn);
+    return { state: "started" };
+  }
+
+  snapshot(): QueueSnapshot {
+    return this.store.snapshot();
+  }
+
+  handleTurnCompleted(turn: CompletedTurn): void {
+    if (turn.status !== "completed") return;
+    this.store.completeTurn(turn.threadId, turn.turnId, this.clock.now());
+  }
+
+  async dispatch(
+    task: QueuedTask,
+    startThread: (workspace: string) => Promise<{ threadId: string }>,
+    startTurn: (threadId: string, prompt: string) => Promise<{ turnId: string }>,
+  ): Promise<void> {
+    const { threadId } = await startThread(task.workspace);
+    this.store.recordManagedThread(task, threadId, this.clock.now());
+    const { turnId } = await startTurn(threadId, task.prompt);
+    this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
+  }
+}
+
+async function handleTaskRequest(
+  request: Record<string, unknown>,
+  taskService: TaskService,
+): Promise<unknown> {
+  switch (request.method) {
+    case "task/add": {
+      if (
+        !isRecord(request.params)
+        || typeof request.params.workspace !== "string"
+        || typeof request.params.prompt !== "string"
+      ) {
+        throw new Error("task/add requires a Workspace and prompt.");
+      }
+      return taskService.add(request.params.workspace, request.params.prompt);
+    }
+    case "queue/start":
+      return taskService.start();
+    case "queue/status":
+      return taskService.snapshot();
+    default:
+      throw new Error("unknown daemon request");
+  }
+}
+
+async function accessibleWorkspace(workspace: string): Promise<string> {
+  const absoluteWorkspace = path.resolve(workspace);
+  try {
+    const canonicalWorkspace = await realpath(absoluteWorkspace);
+    const metadata = await stat(canonicalWorkspace);
+    if (!metadata.isDirectory()) throw new Error("not a directory");
+    await access(
+      canonicalWorkspace,
+      fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK,
+    );
+    return canonicalWorkspace;
+  } catch {
+    throw new Error(`Workspace is not an accessible directory: ${absoluteWorkspace}`);
+  }
+}
+
+function isQueueSnapshot(value: unknown): value is QueueSnapshot {
+  if (!isRecord(value) || !Array.isArray(value.tasks)) return false;
+  if (value.state !== "paused" && value.state !== "running" && value.state !== "idle") {
+    return false;
+  }
+  return value.tasks.every((task) =>
+    isRecord(task)
+    && typeof task.id === "number"
+    && typeof task.workspace === "string"
+    && (task.state === "queued" || task.state === "running" || task.state === "completed")
+    && (task.managedThreadId === undefined || typeof task.managedThreadId === "string")
+    && (task.activeTurnId === undefined || typeof task.activeTurnId === "string")
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isRunningStatus(

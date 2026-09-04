@@ -1,8 +1,9 @@
 # Codex Resumer
 
 Codex Resumer is a local Linux CLI and daemon for coordinating Codex work across
-temporary usage interruptions. This initial slice provides a capability-checked
-daemon lifecycle; Queue and Task commands will be added separately.
+temporary usage interruptions. It provides a capability-checked daemon
+lifecycle and can run a Workspace Task to completion through a durable local
+Queue.
 
 ## Requirements
 
@@ -40,6 +41,19 @@ codex-resumer daemon status
 codex-resumer daemon stop
 ```
 
+Add a Task for an existing Workspace, start the Queue, and inspect its state:
+
+```sh
+codex-resumer task add --workspace ./my-workspace "Implement the requested change"
+codex-resumer queue start
+codex-resumer queue status
+```
+
+Workspace paths are stored as canonical absolute paths. A successful Codex Turn
+completes the Task; no marker is required in the model output. New Threads and
+Turns omit model, reasoning, and personality overrides, so Codex uses the
+user's current defaults.
+
 `daemon start` detaches from the terminal. Starting it again is safe and keeps a
 single daemon instance. At startup, Codex Resumer checks the installed protocol
 schema for the quota, Thread, Turn, interruption, approval, and streamed-error
@@ -60,4 +74,6 @@ Codex Resumer follows the Linux XDG base-directory convention:
   unavailable, `/tmp/codex-resumer-<uid>`
 
 Application directories are mode `0700`; the Unix domain socket and daemon
-status file are mode `0600`.
+status file are mode `0600`. Queue, Task, Managed Thread, and Turn state is kept
+in `state.sqlite3` inside the state directory. Complete prompts are removed from
+the database when their Task completes.
