@@ -15,7 +15,8 @@ import {
   StateStore,
   type QueueSnapshot,
   type QueuedTask,
-  type QuotaWait,
+  type QuotaPause,
+  type QuotaPauseDetails,
 } from "./state-store.js";
 
 const QUOTA_RESET_SAFETY_MS = 2_000;
@@ -26,7 +27,7 @@ export class TaskService {
   #automaticAdvance: Promise<void> = Promise.resolve();
   #completionBeforeTurnStart: CompletedTurn | undefined;
   #quotaBeforeTurnStart: UsageLimitExceeded | undefined;
-  #quotaRecovery = new Map<number, Promise<void>>();
+  #quotaRecovery: Promise<void> = Promise.resolve();
   readonly #stopping = new AbortController();
 
   constructor(
@@ -129,6 +130,10 @@ export class TaskService {
     }
     const { turnId } = await this.appServer.startTurn(threadId, task.prompt);
     this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
+    this.#reconcileTurnStart(threadId, turnId);
+  }
+
+  #reconcileTurnStart(threadId: string, turnId: string): void {
     const quota = this.#quotaBeforeTurnStart;
     if (quota?.threadId === threadId && quota.turnId === turnId) {
       this.#quotaBeforeTurnStart = undefined;
@@ -149,27 +154,26 @@ export class TaskService {
   #scheduleQuotaPause(event: UsageLimitExceeded): void {
     this.#automaticAdvance = this.#automaticAdvance
       .then(async () => {
-        const rateLimits = await this.#readRateLimits().catch(() => emptyRateLimits());
-        const wait = this.store.recordQuotaPause(
+        const rateLimits = await this.appServer.readRateLimits()
+          .catch(() => emptyRateLimits());
+        const quotaPause = this.store.recordQuotaPause(
           event.threadId,
           event.turnId,
           selectApplicableQuota(rateLimits),
         );
-        if (wait) this.#scheduleQuotaRecovery(wait);
+        if (quotaPause) this.#scheduleQuotaRecovery(quotaPause);
       })
       .catch(() => undefined);
   }
 
-  #scheduleQuotaRecovery(wait: QuotaWait): void {
-    if (this.#quotaRecovery.has(wait.taskId)) return;
-    const recovery = this.#recoverFromQuota(wait)
-      .catch(() => undefined)
-      .finally(() => this.#quotaRecovery.delete(wait.taskId));
-    this.#quotaRecovery.set(wait.taskId, recovery);
+  #scheduleQuotaRecovery(quotaPause: QuotaPause): void {
+    this.#quotaRecovery = this.#quotaRecovery
+      .then(() => this.#recoverFromQuota(quotaPause))
+      .catch(() => undefined);
   }
 
-  async #recoverFromQuota(wait: QuotaWait): Promise<void> {
-    let current: QuotaWait | undefined = wait;
+  async #recoverFromQuota(quotaPause: QuotaPause): Promise<void> {
+    let current: QuotaPause | undefined = quotaPause;
     while (current && !this.#stopping.signal.aborted) {
       await waitUntil(
         this.clock,
@@ -177,16 +181,17 @@ export class TaskService {
         this.#stopping.signal,
       );
       if (this.#stopping.signal.aborted || !this.store.isQueueRunning()) return;
-      current = this.store.quotaWait(wait.taskId);
+      current = this.store.readQuotaPause(quotaPause.taskId);
       if (!current) return;
 
-      const rateLimits = await this.#readRateLimits().catch(() => emptyRateLimits());
+      const rateLimits = await this.appServer.readRateLimits()
+        .catch(() => emptyRateLimits());
       if (!quotaIsAvailable(rateLimits, current.limitId)) {
         const refreshed = quotaForLimit(rateLimits, current.limitId);
         const resetAt = refreshed.resetAt;
         const resetIsAhead = resetAt !== undefined
           && resetAt.getTime() + QUOTA_RESET_SAFETY_MS > this.clock.now().getTime();
-        current = this.store.updateQuotaWait(current.taskId, {
+        current = this.store.updateQuotaPause(current.taskId, {
           limitId: refreshed.limitId ?? current.limitId,
           limitType: refreshed.limitType ?? current.limitType,
           pollAttempt: resetIsAhead ? 0 : current.pollAttempt + 1,
@@ -200,7 +205,7 @@ export class TaskService {
     }
   }
 
-  async #startContinuation(current: QuotaWait): Promise<void> {
+  async #startContinuation(current: QuotaPause): Promise<void> {
     const { threadId } = await this.appServer.resumeThread(current.threadId);
     this.store.activateManagedThread(threadId);
     const { turnId } = await this.appServer.startTurn(
@@ -213,22 +218,7 @@ export class TaskService {
       turnId,
       this.clock.now(),
     )) return;
-
-    const quota = this.#quotaBeforeTurnStart;
-    if (quota?.threadId === threadId && quota.turnId === turnId) {
-      this.#quotaBeforeTurnStart = undefined;
-      this.#scheduleQuotaPause(quota);
-    }
-    const completion = this.#completionBeforeTurnStart;
-    if (completion?.threadId === threadId && completion.turnId === turnId) {
-      this.#completionBeforeTurnStart = undefined;
-      this.store.completeTurn(threadId, turnId, this.clock.now());
-      this.#scheduleAutomaticAdvance();
-    }
-  }
-
-  async #readRateLimits(): Promise<AccountRateLimits> {
-    return this.appServer.readRateLimits();
+    this.#reconcileTurnStart(threadId, turnId);
   }
 
   #scheduleAutomaticAdvance(): void {
@@ -244,11 +234,7 @@ export class TaskService {
   }
 }
 
-function selectApplicableQuota(rateLimits: AccountRateLimits): {
-  limitId: string | undefined;
-  limitType: string | undefined;
-  resetAt: Date | undefined;
-} {
+function selectApplicableQuota(rateLimits: AccountRateLimits): QuotaPauseDetails {
   const buckets = rateLimitBuckets(rateLimits);
   const reached = buckets.filter((candidate) =>
     candidate.snapshot.rateLimitReachedType !== null
@@ -284,9 +270,7 @@ function quotaIsAvailable(
   rateLimits: AccountRateLimits,
   limitId: string | undefined,
 ): boolean {
-  const bucket = rateLimitBuckets(rateLimits).find((candidate) =>
-    limitId === undefined || candidate.id === limitId
-  )?.snapshot;
+  const bucket = quotaBucket(rateLimits, limitId)?.snapshot;
   if (!bucket || bucket.rateLimitReachedType !== null) return false;
   return [bucket.primary, bucket.secondary].every(
     (window) => window === null || window.usedPercent < 100,
@@ -296,14 +280,8 @@ function quotaIsAvailable(
 function quotaForLimit(
   rateLimits: AccountRateLimits,
   limitId: string | undefined,
-): {
-  limitId: string | undefined;
-  limitType: string | undefined;
-  resetAt: Date | undefined;
-} {
-  const selected = rateLimitBuckets(rateLimits).find((candidate) =>
-    limitId === undefined || candidate.id === limitId
-  );
+): QuotaPauseDetails {
+  const selected = quotaBucket(rateLimits, limitId);
   return {
     limitId: selected?.id,
     limitType: selected?.snapshot.rateLimitReachedType ?? undefined,
@@ -314,18 +292,37 @@ function quotaForLimit(
 function rateLimitBuckets(
   rateLimits: AccountRateLimits,
 ): Array<{ id: string | undefined; snapshot: RateLimitSnapshot }> {
-  if (
+  const buckets: Array<{ id: string | undefined; snapshot: RateLimitSnapshot }> =
     rateLimits.rateLimitsByLimitId
-    && Object.keys(rateLimits.rateLimitsByLimitId).length > 0
-  ) {
-    return Object.entries(rateLimits.rateLimitsByLimitId).map(([id, snapshot]) => ({
+    ? Object.entries(rateLimits.rateLimitsByLimitId).map(([id, snapshot]) => ({
       id: snapshot.limitId ?? id,
       snapshot,
-    }));
-  }
-  return rateLimits.rateLimits
-    ? [{ id: rateLimits.rateLimits.limitId ?? undefined, snapshot: rateLimits.rateLimits }]
+    }))
     : [];
+  if (rateLimits.rateLimits) {
+    const legacyId = rateLimits.rateLimits.limitId ?? undefined;
+    if (!buckets.some((candidate) => candidate.id === legacyId)) {
+      buckets.push({ id: legacyId, snapshot: rateLimits.rateLimits });
+    }
+  }
+  return buckets;
+}
+
+function quotaBucket(
+  rateLimits: AccountRateLimits,
+  limitId: string | undefined,
+): { id: string | undefined; snapshot: RateLimitSnapshot } | undefined {
+  const buckets = rateLimitBuckets(rateLimits);
+  if (limitId !== undefined) {
+    return buckets.find((candidate) => candidate.id === limitId);
+  }
+  if (rateLimits.rateLimits) {
+    return {
+      id: rateLimits.rateLimits.limitId ?? undefined,
+      snapshot: rateLimits.rateLimits,
+    };
+  }
+  return buckets.length === 1 ? buckets[0] : undefined;
 }
 
 function latestReset(snapshot: RateLimitSnapshot): Date | undefined {
@@ -343,15 +340,15 @@ function latestReset(snapshot: RateLimitSnapshot): Date | undefined {
   return resetsAt === undefined ? undefined : new Date(resetsAt * 1_000);
 }
 
-function nextQuotaCheck(wait: QuotaWait, now: Date): Date {
+function nextQuotaCheck(quotaPause: QuotaPause, now: Date): Date {
   if (
-    wait.resetAt
-    && wait.resetAt.getTime() + QUOTA_RESET_SAFETY_MS > now.getTime()
+    quotaPause.resetAt
+    && quotaPause.resetAt.getTime() + QUOTA_RESET_SAFETY_MS > now.getTime()
   ) {
-    return new Date(wait.resetAt.getTime() + QUOTA_RESET_SAFETY_MS);
+    return new Date(quotaPause.resetAt.getTime() + QUOTA_RESET_SAFETY_MS);
   }
   const backoff = Math.min(
-    QUOTA_POLL_INITIAL_MS * 2 ** wait.pollAttempt,
+    QUOTA_POLL_INITIAL_MS * 2 ** quotaPause.pollAttempt,
     QUOTA_POLL_MAX_MS,
   );
   return new Date(now.getTime() + backoff);

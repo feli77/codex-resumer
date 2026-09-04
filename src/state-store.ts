@@ -28,11 +28,14 @@ export interface TaskSummary {
   workspace: string;
 }
 
-export interface QuotaWait {
+export interface QuotaPauseDetails {
   limitId: string | undefined;
   limitType: string | undefined;
-  pollAttempt: number;
   resetAt: Date | undefined;
+}
+
+export interface QuotaPause extends QuotaPauseDetails {
+  pollAttempt: number;
   taskId: number;
   threadId: string;
   turnId: string;
@@ -60,6 +63,50 @@ interface OrderedTaskRow {
   state: TaskState;
 }
 
+function createTasksTable(ifMissing = false): string {
+  return `
+    CREATE TABLE ${ifMissing ? "IF NOT EXISTS " : ""}tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      workspace TEXT NOT NULL,
+      prompt TEXT,
+      state TEXT NOT NULL CHECK (
+        state IN ('queued', 'running', 'waiting_for_quota', 'completed', 'cancelled')
+      ),
+      managed_thread_id TEXT,
+      active_turn_id TEXT,
+      quota_limit_id TEXT,
+      quota_limit_type TEXT,
+      quota_reset_at TEXT,
+      quota_poll_attempt INTEGER NOT NULL DEFAULT 0,
+      queue_position INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      cancelled_at TEXT
+    );
+  `;
+}
+
+function createTurnsTable(ifMissing = false): string {
+  return `
+    CREATE TABLE ${ifMissing ? "IF NOT EXISTS " : ""}turns (
+      id TEXT PRIMARY KEY,
+      task_id INTEGER NOT NULL REFERENCES tasks(id),
+      managed_thread_id TEXT NOT NULL REFERENCES managed_threads(id),
+      state TEXT NOT NULL CHECK (state IN ('in_progress', 'quota_paused', 'completed')),
+      started_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+  `;
+}
+
+function createActiveTaskIndex(ifMissing = false): string {
+  return `
+    CREATE UNIQUE INDEX ${ifMissing ? "IF NOT EXISTS " : ""}one_active_task
+      ON tasks((1)) WHERE state IN ('running', 'waiting_for_quota');
+  `;
+}
+
 export class StateStore {
   readonly #database: Database.Database;
 
@@ -74,28 +121,8 @@ export class StateStore {
         updated_at TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        workspace TEXT NOT NULL,
-        prompt TEXT,
-        state TEXT NOT NULL CHECK (
-          state IN ('queued', 'running', 'waiting_for_quota', 'completed', 'cancelled')
-        ),
-        managed_thread_id TEXT,
-        active_turn_id TEXT,
-        quota_limit_id TEXT,
-        quota_limit_type TEXT,
-        quota_reset_at TEXT,
-        quota_poll_attempt INTEGER NOT NULL DEFAULT 0,
-        queue_position INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        started_at TEXT,
-        completed_at TEXT,
-        cancelled_at TEXT
-      );
-
-      CREATE UNIQUE INDEX IF NOT EXISTS one_active_task
-        ON tasks((1)) WHERE state IN ('running', 'waiting_for_quota');
+      ${createTasksTable(true)}
+      ${createActiveTaskIndex(true)}
 
       CREATE TABLE IF NOT EXISTS managed_threads (
         id TEXT PRIMARY KEY,
@@ -105,14 +132,7 @@ export class StateStore {
         last_turn_completed_at TEXT
       );
 
-      CREATE TABLE IF NOT EXISTS turns (
-        id TEXT PRIMARY KEY,
-        task_id INTEGER NOT NULL REFERENCES tasks(id),
-        managed_thread_id TEXT NOT NULL REFERENCES managed_threads(id),
-        state TEXT NOT NULL CHECK (state IN ('in_progress', 'quota_paused', 'completed')),
-        started_at TEXT NOT NULL,
-        completed_at TEXT
-      );
+      ${createTurnsTable(true)}
     `);
     this.#migrateTaskQueue();
     this.#migrateQuotaPause();
@@ -308,12 +328,8 @@ export class StateStore {
   recordQuotaPause(
     managedThreadId: string,
     turnId: string,
-    quota: {
-      limitId: string | undefined;
-      limitType: string | undefined;
-      resetAt: Date | undefined;
-    },
-  ): QuotaWait | undefined {
+    quota: QuotaPauseDetails,
+  ): QuotaPause | undefined {
     return this.#database.transaction(() => {
       const task = this.#database.prepare(`
         SELECT id FROM tasks
@@ -348,7 +364,7 @@ export class StateStore {
     })();
   }
 
-  quotaWait(taskId: number): QuotaWait | undefined {
+  readQuotaPause(taskId: number): QuotaPause | undefined {
     const row = this.#database.prepare(`
       SELECT id, managed_thread_id, active_turn_id, quota_limit_id,
              quota_limit_type, quota_reset_at, quota_poll_attempt
@@ -374,15 +390,10 @@ export class StateStore {
     };
   }
 
-  updateQuotaWait(
+  updateQuotaPause(
     taskId: number,
-    quota: {
-      limitId: string | undefined;
-      limitType: string | undefined;
-      pollAttempt: number;
-      resetAt: Date | undefined;
-    },
-  ): QuotaWait | undefined {
+    quota: QuotaPauseDetails & { pollAttempt: number },
+  ): QuotaPause | undefined {
     const result = this.#database.prepare(`
       UPDATE tasks
       SET quota_limit_id = ?, quota_limit_type = ?, quota_reset_at = ?,
@@ -395,7 +406,7 @@ export class StateStore {
       quota.pollAttempt,
       taskId,
     );
-    return result.changes === 1 ? this.quotaWait(taskId) : undefined;
+    return result.changes === 1 ? this.readQuotaPause(taskId) : undefined;
   }
 
   isQueueRunning(): boolean {
@@ -505,27 +516,7 @@ export class StateStore {
           ALTER TABLE turns RENAME TO turns_before_queue;
           ALTER TABLE tasks RENAME TO tasks_before_queue;
 
-          CREATE TABLE tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            workspace TEXT NOT NULL,
-            prompt TEXT,
-            state TEXT NOT NULL CHECK (
-              state IN (
-                'queued', 'running', 'waiting_for_quota', 'completed', 'cancelled'
-              )
-            ),
-            managed_thread_id TEXT,
-            active_turn_id TEXT,
-            quota_limit_id TEXT,
-            quota_limit_type TEXT,
-            quota_reset_at TEXT,
-            quota_poll_attempt INTEGER NOT NULL DEFAULT 0,
-            queue_position INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            started_at TEXT,
-            completed_at TEXT,
-            cancelled_at TEXT
-          );
+          ${createTasksTable()}
           INSERT INTO tasks (
             id, workspace, prompt, state, managed_thread_id, active_turn_id,
             quota_limit_id, quota_limit_type, quota_reset_at, quota_poll_attempt,
@@ -536,16 +527,7 @@ export class StateStore {
             NULL, NULL, NULL, 0, id, created_at, started_at, completed_at, NULL
           FROM tasks_before_queue;
 
-          CREATE TABLE turns (
-            id TEXT PRIMARY KEY,
-            task_id INTEGER NOT NULL REFERENCES tasks(id),
-            managed_thread_id TEXT NOT NULL REFERENCES managed_threads(id),
-            state TEXT NOT NULL CHECK (
-              state IN ('in_progress', 'quota_paused', 'completed')
-            ),
-            started_at TEXT NOT NULL,
-            completed_at TEXT
-          );
+          ${createTurnsTable()}
           INSERT INTO turns (
             id, task_id, managed_thread_id, state, started_at, completed_at
           )
@@ -554,8 +536,7 @@ export class StateStore {
 
           DROP TABLE turns_before_queue;
           DROP TABLE tasks_before_queue;
-          CREATE UNIQUE INDEX one_active_task
-            ON tasks((1)) WHERE state IN ('running', 'waiting_for_quota');
+          ${createActiveTaskIndex()}
         `);
       })();
     } finally {
@@ -578,27 +559,7 @@ export class StateStore {
           ALTER TABLE turns RENAME TO turns_before_quota_pause;
           ALTER TABLE tasks RENAME TO tasks_before_quota_pause;
 
-          CREATE TABLE tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            workspace TEXT NOT NULL,
-            prompt TEXT,
-            state TEXT NOT NULL CHECK (
-              state IN (
-                'queued', 'running', 'waiting_for_quota', 'completed', 'cancelled'
-              )
-            ),
-            managed_thread_id TEXT,
-            active_turn_id TEXT,
-            quota_limit_id TEXT,
-            quota_limit_type TEXT,
-            quota_reset_at TEXT,
-            quota_poll_attempt INTEGER NOT NULL DEFAULT 0,
-            queue_position INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            started_at TEXT,
-            completed_at TEXT,
-            cancelled_at TEXT
-          );
+          ${createTasksTable()}
           INSERT INTO tasks (
             id, workspace, prompt, state, managed_thread_id, active_turn_id,
             quota_limit_id, quota_limit_type, quota_reset_at, quota_poll_attempt,
@@ -610,16 +571,7 @@ export class StateStore {
             completed_at, cancelled_at
           FROM tasks_before_quota_pause;
 
-          CREATE TABLE turns (
-            id TEXT PRIMARY KEY,
-            task_id INTEGER NOT NULL REFERENCES tasks(id),
-            managed_thread_id TEXT NOT NULL REFERENCES managed_threads(id),
-            state TEXT NOT NULL CHECK (
-              state IN ('in_progress', 'quota_paused', 'completed')
-            ),
-            started_at TEXT NOT NULL,
-            completed_at TEXT
-          );
+          ${createTurnsTable()}
           INSERT INTO turns (
             id, task_id, managed_thread_id, state, started_at, completed_at
           )
@@ -628,8 +580,7 @@ export class StateStore {
 
           DROP TABLE turns_before_quota_pause;
           DROP TABLE tasks_before_quota_pause;
-          CREATE UNIQUE INDEX one_active_task
-            ON tasks((1)) WHERE state IN ('running', 'waiting_for_quota');
+          ${createActiveTaskIndex()}
         `);
       })();
     } finally {
