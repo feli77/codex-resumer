@@ -67,7 +67,7 @@ export class StateStore {
         workspace TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('active', 'idle')),
         created_at TEXT NOT NULL,
-        completed_at TEXT
+        last_turn_completed_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS turns (
@@ -178,7 +178,7 @@ export class StateStore {
       `).run(completedAt, turnId);
       this.#database.prepare(`
         UPDATE managed_threads
-        SET state = 'idle', completed_at = ? WHERE id = ?
+        SET state = 'idle', last_turn_completed_at = ? WHERE id = ?
       `).run(completedAt, managedThreadId);
       this.#database.prepare(`
         UPDATE tasks SET state = 'completed', prompt = NULL, completed_at = ?
