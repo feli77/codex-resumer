@@ -5,7 +5,10 @@ import type { DaemonPaths } from "./paths.js";
 export const DEFAULT_CONTINUATION_PROMPT =
   "Inspect the current Thread and Workspace state, continue the unfinished Task, and do not repeat work that is already complete.";
 
+export type AccessMode = "configured" | "full";
+
 export interface Configuration {
+  accessMode: AccessMode;
   continuationPrompt: string;
 }
 
@@ -15,7 +18,10 @@ export async function readConfiguration(configPath: string): Promise<Configurati
     contents = await readFile(configPath, "utf8");
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
-      return { continuationPrompt: DEFAULT_CONTINUATION_PROMPT };
+      return {
+        accessMode: "configured",
+        continuationPrompt: DEFAULT_CONTINUATION_PROMPT,
+      };
     }
     throw error;
   }
@@ -27,12 +33,20 @@ export async function readConfiguration(configPath: string): Promise<Configurati
   }
   if (
     !isRecord(value)
+    || (
+      value.accessMode !== undefined
+      && value.accessMode !== "configured"
+      && value.accessMode !== "full"
+    )
     || typeof value.continuationPrompt !== "string"
     || value.continuationPrompt.trim().length === 0
   ) {
     throw new Error(`Invalid Codex Resumer configuration: ${configPath}`);
   }
-  return { continuationPrompt: value.continuationPrompt };
+  return {
+    accessMode: value.accessMode ?? "configured",
+    continuationPrompt: value.continuationPrompt,
+  };
 }
 
 export async function setContinuationPrompt(
@@ -42,12 +56,28 @@ export async function setContinuationPrompt(
   if (prompt.trim().length === 0) {
     throw new Error("Continuation prompt must not be empty.");
   }
+  const configuration = await readConfiguration(paths.configPath);
+  await writeConfiguration(paths, { ...configuration, continuationPrompt: prompt });
+}
+
+export async function setAccessMode(
+  paths: Pick<DaemonPaths, "configDir" | "configPath">,
+  accessMode: AccessMode,
+): Promise<void> {
+  const configuration = await readConfiguration(paths.configPath);
+  await writeConfiguration(paths, { ...configuration, accessMode });
+}
+
+async function writeConfiguration(
+  paths: Pick<DaemonPaths, "configDir" | "configPath">,
+  configuration: Configuration,
+): Promise<void> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
   await chmod(paths.configDir, 0o700);
   const temporaryPath = `${paths.configPath}.${process.pid}.tmp`;
   await writeFile(
     temporaryPath,
-    `${JSON.stringify({ continuationPrompt: prompt }, null, 2)}\n`,
+    `${JSON.stringify(configuration, null, 2)}\n`,
     { mode: 0o600 },
   );
   await chmod(temporaryPath, 0o600);

@@ -73,3 +73,34 @@ test("queue start requires an explicit Run Policy with a zoned Cutoff Time", asy
     },
   );
 });
+
+test("global configuration exposes Access Mode and the Continuation prompt", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-config-cli-test-"));
+  const env = {
+    ...process.env,
+    HOME: root,
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    XDG_RUNTIME_DIR: path.join(root, "runtime"),
+    XDG_STATE_HOME: path.join(root, "state"),
+  };
+  const runCli = async (...args: string[]): Promise<string> => {
+    const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], {
+      encoding: "utf8",
+      env,
+    });
+    return stdout;
+  };
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.equal(
+    await runCli("config", "show"),
+    "Access Mode: Configured Access\n"
+      + "Continuation prompt: Inspect the current Thread and Workspace state, "
+      + "continue the unfinished Task, and do not repeat work that is already complete.\n",
+  );
+  assert.equal(
+    await runCli("config", "set", "accessMode", "full"),
+    "Access Mode updated to Full Access.\n",
+  );
+  assert.match(await runCli("config", "show"), /^Access Mode: Full Access\n/);
+});

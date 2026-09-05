@@ -2,7 +2,9 @@ import { chmodSync } from "node:fs";
 
 import Database from "better-sqlite3";
 
+import type { AccessMode } from "./config.js";
 import type { RunPolicy } from "./run-policy.js";
+import type { StructuredError } from "./structured-error.js";
 
 export type QueueState = "paused" | "running" | "idle";
 export type PauseReason =
@@ -47,11 +49,14 @@ export interface QuotaPause extends QuotaPauseDetails {
   taskId: number;
   threadId: string;
   turnId: string;
+  workspace: string;
 }
 
 export interface QueueSnapshot {
+  error?: StructuredError;
   pauseReason?: PauseReason;
   queueRun?: {
+    accessMode: AccessMode;
     cutoffTime?: string;
     endedAt?: string;
     id: number;
@@ -63,6 +68,7 @@ export interface QueueSnapshot {
 }
 
 interface QueueRunRow {
+  access_mode: AccessMode;
   cutoff_time: string | null;
   ended_at: string | null;
   id: number;
@@ -146,12 +152,17 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS queue (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         state TEXT NOT NULL CHECK (state IN ('paused', 'running')),
+        pause_reason TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        error_details TEXT,
         updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS queue_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         run_policy TEXT NOT NULL CHECK (run_policy IN ('until_idle', 'cutoff_time')),
+        access_mode TEXT NOT NULL CHECK (access_mode IN ('configured', 'full')),
         cutoff_time TEXT,
         started_at TEXT NOT NULL,
         ended_at TEXT,
@@ -177,6 +188,8 @@ export class StateStore {
     this.#migrateTaskQueue();
     this.#migrateQuotaPause();
     this.#migrateQueuePauseReason();
+    this.#migrateQueueError();
+    this.#migrateQueueRunAccessMode();
     this.#database.prepare(`
       INSERT OR IGNORE INTO queue (id, state, pause_reason, updated_at)
       VALUES (1, 'paused', 'not_started', ?)
@@ -185,6 +198,7 @@ export class StateStore {
 
   startQueueRun(
     runPolicy: RunPolicy,
+    accessMode: AccessMode,
     now: Date,
   ): "started" | "already-running" {
     return this.#database.transaction(() => {
@@ -199,30 +213,43 @@ export class StateStore {
       }
 
       this.#database.prepare(`
-        INSERT INTO queue_runs (run_policy, cutoff_time, started_at)
-        VALUES (?, ?, ?)
+        INSERT INTO queue_runs (run_policy, access_mode, cutoff_time, started_at)
+        VALUES (?, ?, ?, ?)
       `).run(
         runPolicy.kind,
+        accessMode,
         runPolicy.kind === "cutoff_time" ? runPolicy.cutoffTime : null,
         now.toISOString(),
       );
       this.#database.prepare(`
-        UPDATE queue SET state = 'running', pause_reason = NULL, updated_at = ?
+        UPDATE queue
+        SET state = 'running', pause_reason = NULL, error_code = NULL,
+            error_message = NULL, error_details = NULL, updated_at = ?
         WHERE id = 1
       `).run(now.toISOString());
       return "started" as const;
     })();
   }
 
-  restoreQueueRun(now: Date): RunPolicy | undefined {
-    return this.#database.transaction((): RunPolicy | undefined => {
+  restoreQueueRun(
+    now: Date,
+  ): { accessMode: AccessMode; runPolicy: RunPolicy } | undefined {
+    return this.#database.transaction(() => {
       const state = this.#queueRunState(now);
       if (state.kind !== "running") return undefined;
       const activeRun = state.queueRun;
-      if (activeRun.cutoff_time === null) return { kind: "until_idle" };
+      if (activeRun.cutoff_time === null) {
+        return {
+          accessMode: activeRun.access_mode,
+          runPolicy: { kind: "until_idle" } as const,
+        };
+      }
       return {
-        cutoffTime: activeRun.cutoff_time,
-        kind: "cutoff_time",
+        accessMode: activeRun.access_mode,
+        runPolicy: {
+          cutoffTime: activeRun.cutoff_time,
+          kind: "cutoff_time",
+        } as const,
       };
     })();
   }
@@ -298,17 +325,17 @@ export class StateStore {
     })();
   }
 
-  releaseTaskBeforeDispatch(taskId: number, now: Date): void {
+  releaseTaskBeforeDispatch(
+    taskId: number,
+    error: StructuredError,
+    now: Date,
+  ): void {
     this.#database.transaction(() => {
       this.#database.prepare(`
         UPDATE tasks SET state = 'queued', started_at = NULL
         WHERE id = ? AND state = 'running'
       `).run(taskId);
-      this.#database.prepare(`
-        UPDATE queue SET state = 'paused', pause_reason = 'needs_attention', updated_at = ?
-        WHERE id = 1
-      `).run(now.toISOString());
-      this.#endActiveQueueRun(now);
+      this.#pauseQueue("needs_attention", now, error);
     })();
   }
 
@@ -421,9 +448,9 @@ export class StateStore {
   ): QuotaPause | undefined {
     return this.#database.transaction(() => {
       const task = this.#database.prepare(`
-        SELECT id FROM tasks
+        SELECT id, workspace FROM tasks
         WHERE managed_thread_id = ? AND active_turn_id = ? AND state = 'running'
-      `).get(managedThreadId, turnId) as { id: number } | undefined;
+      `).get(managedThreadId, turnId) as { id: number; workspace: string } | undefined;
       if (!task) return undefined;
 
       this.#database.prepare(`
@@ -449,6 +476,7 @@ export class StateStore {
         taskId: task.id,
         threadId: managedThreadId,
         turnId,
+        workspace: task.workspace,
       };
     })();
   }
@@ -456,7 +484,7 @@ export class StateStore {
   readQuotaPause(taskId: number): QuotaPause | undefined {
     const row = this.#database.prepare(`
       SELECT id, managed_thread_id, active_turn_id, quota_limit_id,
-             quota_limit_type, quota_reset_at, quota_poll_attempt
+             quota_limit_type, quota_reset_at, quota_poll_attempt, workspace
       FROM tasks WHERE id = ? AND state = 'waiting_for_quota'
     `).get(taskId) as {
       active_turn_id: string;
@@ -466,6 +494,7 @@ export class StateStore {
       quota_limit_type: string | null;
       quota_poll_attempt: number;
       quota_reset_at: string | null;
+      workspace: string;
     } | undefined;
     if (!row) return undefined;
     return {
@@ -476,6 +505,7 @@ export class StateStore {
       taskId: row.id,
       threadId: row.managed_thread_id,
       turnId: row.active_turn_id,
+      workspace: row.workspace,
     };
   }
 
@@ -584,6 +614,26 @@ export class StateStore {
     })();
   }
 
+  recordQuotaRecoveryFailure(
+    taskId: number,
+    error: StructuredError,
+    now: Date,
+  ): boolean {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT managed_thread_id FROM tasks
+        WHERE id = ? AND state = 'waiting_for_quota'
+      `).get(taskId) as { managed_thread_id: string } | undefined;
+      if (!task) return false;
+
+      this.#database.prepare(`
+        UPDATE managed_threads SET state = 'idle' WHERE id = ?
+      `).run(task.managed_thread_id);
+      this.#pauseQueue("needs_attention", now, error);
+      return true;
+    })();
+  }
+
   completeTurn(managedThreadId: string, turnId: string, now: Date): boolean {
     return this.#database.transaction(() => {
       const turn = this.#database.prepare(`
@@ -612,9 +662,16 @@ export class StateStore {
   }
 
   snapshot(): QueueSnapshot {
-    const queue = this.#database.prepare(
-      "SELECT state, pause_reason FROM queue WHERE id = 1",
-    ).get() as { pause_reason: PauseReason | null; state: "paused" | "running" };
+    const queue = this.#database.prepare(`
+      SELECT state, pause_reason, error_code, error_message, error_details
+      FROM queue WHERE id = 1
+    `).get() as {
+      error_code: string | null;
+      error_details: string | null;
+      error_message: string | null;
+      pause_reason: PauseReason | null;
+      state: "paused" | "running";
+    };
     const queueRun = this.#latestQueueRun();
     const tasks = this.#database.prepare(`
       SELECT id, workspace, state, managed_thread_id, active_turn_id, prompt,
@@ -632,10 +689,22 @@ export class StateStore {
           && (queueRun?.ended_at !== null || !hasUnfinishedTask)
         ? "idle"
         : queue.state,
+      ...(queue.error_code === null || queue.error_message === null
+        ? {}
+        : {
+          error: {
+            code: queue.error_code,
+            ...(queue.error_details === null
+              ? {}
+              : { details: JSON.parse(queue.error_details) as unknown }),
+            message: queue.error_message,
+          },
+        }),
       ...(queue.pause_reason === null ? {} : { pauseReason: queue.pause_reason }),
       ...(queueRun
         ? {
           queueRun: {
+            accessMode: queueRun.access_mode,
             id: queueRun.id,
             runPolicy: queueRun.run_policy,
             startedAt: queueRun.started_at,
@@ -765,11 +834,35 @@ export class StateStore {
     `).run();
   }
 
+  #migrateQueueError(): void {
+    const columns = this.#database.pragma("table_info(queue)") as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+    if (!names.has("error_code")) {
+      this.#database.exec("ALTER TABLE queue ADD COLUMN error_code TEXT");
+    }
+    if (!names.has("error_message")) {
+      this.#database.exec("ALTER TABLE queue ADD COLUMN error_message TEXT");
+    }
+    if (!names.has("error_details")) {
+      this.#database.exec("ALTER TABLE queue ADD COLUMN error_details TEXT");
+    }
+  }
+
   #latestQueueRun(): QueueRunRow | undefined {
     return this.#database.prepare(`
-      SELECT id, run_policy, cutoff_time, started_at, ended_at
+      SELECT id, run_policy, access_mode, cutoff_time, started_at, ended_at
       FROM queue_runs ORDER BY id DESC LIMIT 1
     `).get() as QueueRunRow | undefined;
+  }
+
+  #migrateQueueRunAccessMode(): void {
+    const columns = this.#database.pragma("table_info(queue_runs)") as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "access_mode")) return;
+    this.#database.exec(`
+      ALTER TABLE queue_runs
+      ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'configured'
+        CHECK (access_mode IN ('configured', 'full'));
+    `);
   }
 
   #queueRunState(now: Date): PersistedQueueRunState {
@@ -797,11 +890,23 @@ export class StateStore {
     `).run(now.toISOString());
   }
 
-  #pauseQueue(reason: PauseReason, now: Date): void {
+  #pauseQueue(
+    reason: PauseReason,
+    now: Date,
+    error?: StructuredError,
+  ): void {
     this.#database.prepare(`
-      UPDATE queue SET state = 'paused', pause_reason = ?, updated_at = ?
+      UPDATE queue
+      SET state = 'paused', pause_reason = ?, error_code = ?,
+          error_message = ?, error_details = ?, updated_at = ?
       WHERE id = 1
-    `).run(reason, now.toISOString());
+    `).run(
+      reason,
+      error?.code ?? null,
+      error?.message ?? null,
+      error?.details === undefined ? null : JSON.stringify(error.details),
+      now.toISOString(),
+    );
     this.#endActiveQueueRun(now);
   }
 }

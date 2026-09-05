@@ -2,8 +2,9 @@ import { constants as fsConstants } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { DEFAULT_CONTINUATION_PROMPT } from "./config.js";
+import { DEFAULT_CONTINUATION_PROMPT, type AccessMode } from "./config.js";
 import { normalizeCutoffTime, type RunPolicy } from "./run-policy.js";
+import { serializeOperationalError } from "./structured-error.js";
 import type {
   AccountRateLimits,
   AppServerController,
@@ -26,6 +27,7 @@ const QUOTA_POLL_MAX_MS = 15 * 60_000;
 
 export class TaskService {
   #automaticAdvance: Promise<void> = Promise.resolve();
+  #accessMode: AccessMode | undefined;
   #completionBeforeTurnStart: CompletedTurn | undefined;
   #quotaBeforeTurnStart: UsageLimitExceeded | undefined;
   #quotaRecovery: Promise<void> = Promise.resolve();
@@ -70,22 +72,26 @@ export class TaskService {
 
   async start(
     runPolicy: RunPolicy,
+    accessMode: AccessMode = "configured",
   ): Promise<{ state: "started" | "already-running" | "idle" | "paused" }> {
-    const result = this.store.startQueueRun(runPolicy, this.clock.now());
+    const result = this.store.startQueueRun(runPolicy, accessMode, this.clock.now());
     if (result === "already-running") return { state: result };
-    const next = await this.#continueQueueRun(runPolicy);
+    const next = await this.#continueQueueRun(runPolicy, accessMode);
     return { state: next === "already-running" ? "started" : next };
   }
 
   async restoreQueueRun(): Promise<void> {
-    const runPolicy = this.store.restoreQueueRun(this.clock.now());
-    if (!runPolicy) return;
-    await this.#continueQueueRun(runPolicy).catch(() => undefined);
+    const queueRun = this.store.restoreQueueRun(this.clock.now());
+    if (!queueRun) return;
+    await this.#continueQueueRun(queueRun.runPolicy, queueRun.accessMode)
+      .catch(() => undefined);
   }
 
   async #continueQueueRun(
     runPolicy: RunPolicy,
+    accessMode: AccessMode,
   ): Promise<"started" | "already-running" | "idle" | "paused"> {
+    this.#accessMode = accessMode;
     this.#scheduleCutoff(runPolicy);
     const quotaPause = this.store.readWaitingQuotaPause();
     if (quotaPause) {
@@ -109,7 +115,11 @@ export class TaskService {
       await accessibleWorkspace(next.task.workspace);
       if (!await this.dispatch(next.task)) return "paused";
     } catch (error) {
-      this.store.releaseTaskBeforeDispatch(next.task.id, this.clock.now());
+      this.store.releaseTaskBeforeDispatch(
+        next.task.id,
+        serializeOperationalError(error),
+        this.clock.now(),
+      );
       throw error;
     }
     return "started";
@@ -163,7 +173,12 @@ export class TaskService {
       this.store.releaseUndispatchedTask(task.id);
       return false;
     }
-    const { turnId } = await this.appServer.startTurn(threadId, task.prompt);
+    const { turnId } = await this.appServer.startTurn(
+      threadId,
+      task.prompt,
+      task.workspace,
+      this.#requiredAccessMode(),
+    );
     this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
     this.#reconcileTurnStart(threadId, turnId);
     return true;
@@ -205,7 +220,14 @@ export class TaskService {
   #scheduleQuotaRecovery(quotaPause: QuotaPause): void {
     this.#quotaRecovery = this.#quotaRecovery
       .then(() => this.#recoverFromQuota(quotaPause))
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (this.#stopping.signal.aborted) return;
+        this.store.recordQuotaRecoveryFailure(
+          quotaPause.taskId,
+          serializeOperationalError(error),
+          this.clock.now(),
+        );
+      });
   }
 
   async #recoverFromQuota(quotaPause: QuotaPause): Promise<void> {
@@ -251,6 +273,8 @@ export class TaskService {
     const { turnId } = await this.appServer.startTurn(
       threadId,
       prompt,
+      current.workspace,
+      this.#requiredAccessMode(),
     );
     if (!this.store.recordContinuationTurnStarted(
       current.taskId,
@@ -259,6 +283,11 @@ export class TaskService {
       this.clock.now(),
     )) return;
     this.#reconcileTurnStart(threadId, turnId);
+  }
+
+  #requiredAccessMode(): AccessMode {
+    if (!this.#accessMode) throw new Error("Queue Run Access Mode is unavailable.");
+    return this.#accessMode;
   }
 
   #scheduleAutomaticAdvance(): void {
@@ -454,11 +483,11 @@ export async function handleTaskRequest(
     }
     case "queue/start": {
       const runPolicy = parseRunPolicy(request.params, "queue/start");
-      return taskService.start(runPolicy);
+      return taskService.start(runPolicy, parseAccessMode(request.params, "queue/start"));
     }
     case "queue/resume": {
       const runPolicy = parseRunPolicy(request.params, "queue/resume");
-      return taskService.start(runPolicy);
+      return taskService.start(runPolicy, parseAccessMode(request.params, "queue/resume"));
     }
     case "queue/pause":
       return taskService.pause();
@@ -540,4 +569,14 @@ function parseRunPolicy(value: unknown, method: string): RunPolicy {
     }
   }
   throw new Error(`${method} received an invalid Run Policy.`);
+}
+
+function parseAccessMode(value: unknown, method: string): AccessMode {
+  if (
+    !isRecord(value)
+    || (value.accessMode !== "configured" && value.accessMode !== "full")
+  ) {
+    throw new Error(`${method} requires an Access Mode.`);
+  }
+  return value.accessMode;
 }

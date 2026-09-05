@@ -13,6 +13,7 @@ import type {
   RateLimitSnapshot,
   UsageLimitExceeded,
 } from "./daemon.js";
+import type { AccessMode } from "./config.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,6 +21,7 @@ const requiredClientRequests = [
   "initialize",
   "account/read",
   "account/rateLimits/read",
+  "config/read",
   "thread/start",
   "thread/resume",
   "thread/read",
@@ -106,6 +108,22 @@ const schemaFileContracts: readonly SchemaFileContract[] = [
     }],
   },
   {
+    capability: "payload:config/read-request",
+    file: "v2/ConfigReadParams.json",
+    objects: [{ properties: ["cwd", "includeLayers"] }],
+  },
+  {
+    capability: "payload:config/read-response",
+    file: "v2/ConfigReadResponse.json",
+    objects: [
+      { properties: ["config"], required: ["config"] },
+      {
+        definition: "Config",
+        properties: ["approval_policy", "sandbox_mode", "sandbox_workspace_write"],
+      },
+    ],
+  },
+  {
     capability: "payload:thread/start-request",
     file: "v2/ThreadStartParams.json",
     objects: [{ properties: ["cwd", "approvalPolicy", "sandbox"] }],
@@ -129,6 +147,7 @@ const schemaFileContracts: readonly SchemaFileContract[] = [
     objects: [{
       properties: ["threadId", "input", "approvalPolicy", "sandboxPolicy"],
       required: ["threadId", "input"],
+      literals: ["dangerFullAccess", "never", "readOnly", "workspaceWrite"],
     }],
   },
   {
@@ -195,15 +214,17 @@ interface CodexAppServerOptions {
 }
 
 interface PendingRequest {
+  method: string;
   reject(error: Error): void;
   resolve(value: unknown): void;
   timeout: NodeJS.Timeout;
 }
 
-class AppServerRpcError extends Error {
+export class AppServerRpcError extends Error {
   constructor(
     message: string,
-    readonly code: number | undefined,
+    readonly method: string,
+    readonly rpcCode: number | undefined,
     readonly data: unknown,
   ) {
     super(message);
@@ -353,15 +374,42 @@ export class CodexAppServer implements AppServerController {
     return parseAccountRateLimits(await this.#request("account/rateLimits/read"));
   }
 
-  async startTurn(threadId: string, prompt: string): Promise<{ turnId: string }> {
+  async startTurn(
+    threadId: string,
+    prompt: string,
+    workspace: string,
+    accessMode: AccessMode,
+  ): Promise<{ turnId: string }> {
+    const access = accessMode === "full"
+      ? fullAccess()
+      : await this.#readConfiguredAccess(workspace);
     const result = await this.#request("turn/start", {
+      approvalPolicy: access.approvalPolicy,
       threadId,
       input: [{ type: "text", text: prompt }],
+      sandboxPolicy: access.sandboxPolicy,
     });
     if (!isRecord(result) || !isRecord(result.turn) || typeof result.turn.id !== "string") {
       throw new Error("Codex App Server returned an invalid Turn response");
     }
     return { turnId: result.turn.id };
+  }
+
+  async #readConfiguredAccess(workspace: string): Promise<TurnAccess> {
+    const result = await this.#request("config/read", {
+      cwd: workspace,
+      includeLayers: false,
+    });
+    if (!isRecord(result) || !isRecord(result.config)) {
+      throw new Error("Codex App Server returned invalid access configuration");
+    }
+    return {
+      approvalPolicy: parseApprovalPolicy(result.config.approval_policy),
+      sandboxPolicy: parseSandboxPolicy(
+        result.config.sandbox_mode,
+        result.config.sandbox_workspace_write,
+      ),
+    };
   }
 
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void {
@@ -452,7 +500,7 @@ export class CodexAppServer implements AppServerController {
         this.#pending.delete(id);
         reject(new Error(`Codex App Server request timed out: ${method}`));
       }, this.#requestTimeoutMs);
-      this.#pending.set(id, { resolve, reject, timeout });
+      this.#pending.set(id, { method, resolve, reject, timeout });
       child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
         if (!error) return;
         const pending = this.#pending.get(id);
@@ -503,6 +551,7 @@ export class CodexAppServer implements AppServerController {
           typeof rpcError.message === "string"
             ? rpcError.message
             : "Codex App Server rejected the request",
+          pending.method,
           typeof rpcError.code === "number" ? rpcError.code : undefined,
           rpcError.data,
         ),
@@ -519,6 +568,128 @@ export class CodexAppServer implements AppServerController {
     }
     this.#pending.clear();
   }
+}
+
+type ApprovalPolicy =
+  | "never"
+  | "on-request"
+  | "untrusted"
+  | {
+      granular: {
+        mcp_elicitations: boolean;
+        request_permissions?: boolean;
+        rules: boolean;
+        sandbox_approval: boolean;
+        skill_approval?: boolean;
+      };
+    }
+  | null;
+
+type SandboxPolicy =
+  | { type: "dangerFullAccess" }
+  | { networkAccess: false; type: "readOnly" }
+  | {
+      excludeSlashTmp: boolean;
+      excludeTmpdirEnvVar: boolean;
+      networkAccess: boolean;
+      type: "workspaceWrite";
+      writableRoots: string[];
+    }
+  | null;
+
+interface TurnAccess {
+  approvalPolicy: ApprovalPolicy;
+  sandboxPolicy: SandboxPolicy;
+}
+
+function fullAccess(): TurnAccess {
+  return {
+    approvalPolicy: "never",
+    sandboxPolicy: { type: "dangerFullAccess" },
+  };
+}
+
+function parseApprovalPolicy(value: unknown): ApprovalPolicy {
+  if (
+    value === null
+    || value === "never"
+    || value === "on-request"
+    || value === "untrusted"
+  ) return value;
+  if (!isRecord(value) || !isRecord(value.granular)) {
+    throw new Error("Codex App Server returned invalid access configuration");
+  }
+  const granular = value.granular;
+  if (
+    typeof granular.mcp_elicitations !== "boolean"
+    || typeof granular.rules !== "boolean"
+    || typeof granular.sandbox_approval !== "boolean"
+    || (
+      granular.request_permissions !== undefined
+      && typeof granular.request_permissions !== "boolean"
+    )
+    || (
+      granular.skill_approval !== undefined
+      && typeof granular.skill_approval !== "boolean"
+    )
+  ) {
+    throw new Error("Codex App Server returned invalid access configuration");
+  }
+  return {
+    granular: {
+      mcp_elicitations: granular.mcp_elicitations,
+      ...(granular.request_permissions === undefined
+        ? {}
+        : { request_permissions: granular.request_permissions }),
+      rules: granular.rules,
+      sandbox_approval: granular.sandbox_approval,
+      ...(granular.skill_approval === undefined
+        ? {}
+        : { skill_approval: granular.skill_approval }),
+    },
+  };
+}
+
+function parseSandboxPolicy(mode: unknown, options: unknown): SandboxPolicy {
+  if (mode === null) return null;
+  if (mode === "danger-full-access") return { type: "dangerFullAccess" };
+  if (mode === "read-only") return { networkAccess: false, type: "readOnly" };
+  if (mode !== "workspace-write") {
+    throw new Error("Codex App Server returned invalid access configuration");
+  }
+  if (options !== null && !isRecord(options)) {
+    throw new Error("Codex App Server returned invalid access configuration");
+  }
+  const configured = options ?? {};
+  if (!isRecord(configured)) {
+    throw new Error("Codex App Server returned invalid access configuration");
+  }
+  const writableRoots = configured.writable_roots ?? [];
+  if (
+    !Array.isArray(writableRoots)
+    || !writableRoots.every((root) => typeof root === "string")
+    || (
+      configured.network_access !== undefined
+      && typeof configured.network_access !== "boolean"
+    )
+    || (
+      configured.exclude_slash_tmp !== undefined
+      && typeof configured.exclude_slash_tmp !== "boolean"
+    )
+    || (
+      configured.exclude_tmpdir_env_var !== undefined
+      && typeof configured.exclude_tmpdir_env_var !== "boolean"
+    )
+  ) {
+    throw new Error("Codex App Server returned invalid access configuration");
+  }
+  return {
+    excludeSlashTmp: configured.exclude_slash_tmp ?? false,
+    excludeTmpdirEnvVar: configured.exclude_tmpdir_env_var ?? false,
+    networkAccess: configured.network_access ?? false,
+    type: "workspaceWrite",
+    writableRoots,
+  };
 }
 
 function parseUsageLimitExceeded(value: unknown): UsageLimitExceeded | undefined {
@@ -613,7 +784,7 @@ function unauthenticated(
 
 function isAuthenticationError(error: unknown): boolean {
   return error instanceof AppServerRpcError
-    && (error.code === 401 || containsLiteral(error.data, "unauthorized"));
+    && (error.rpcCode === 401 || containsLiteral(error.data, "unauthorized"));
 }
 
 function threadResponseContract(

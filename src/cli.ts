@@ -2,9 +2,15 @@
 
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 
 import { CodexAppServer } from "./app-server.js";
-import { readConfiguration, setContinuationPrompt } from "./config.js";
+import {
+  readConfiguration,
+  setAccessMode,
+  setContinuationPrompt,
+  type AccessMode,
+} from "./config.js";
 import {
   addManagedThreadTask,
   addWorkspaceTask,
@@ -31,11 +37,12 @@ const usage = `Usage:
   codex-resumer task <list|cancel <task-id>>
   codex-resumer task move <task-id> (--before|--after) <task-id>
   codex-resumer thread import <thread-id>
-  codex-resumer queue start (--until-idle | --cutoff <timestamp>)
+  codex-resumer queue start (--until-idle | --cutoff <timestamp>) [--yes]
   codex-resumer queue pause
-  codex-resumer queue resume (--until-idle | --cutoff <timestamp>)
+  codex-resumer queue resume (--until-idle | --cutoff <timestamp>) [--yes]
   codex-resumer queue status
   codex-resumer config show
+  codex-resumer config set accessMode <configured|full>
   codex-resumer config set continuationPrompt <prompt>
 
 Manage the daemon and a FIFO Queue across Managed Threads and Workspaces.
@@ -113,20 +120,7 @@ async function main(args: string[]): Promise<number> {
   }
 
   if (args[0] === "queue" && args[1] === "start") {
-    const result = await startQueueRun(
-      paths,
-      parseRunPolicy(args.slice(2), "queue start"),
-    );
-    process.stdout.write(
-      result === "started"
-        ? "Queue started.\n"
-        : result === "already-running"
-          ? "Queue already has a running Task.\n"
-          : result === "paused"
-            ? "Queue is paused.\n"
-            : "Queue is idle.\n",
-    );
-    return 0;
+    return runManualQueueCommand(paths, "start", args.slice(2));
   }
 
   if (args[0] === "queue" && args[1] === "pause" && args.length === 2) {
@@ -136,20 +130,7 @@ async function main(args: string[]): Promise<number> {
   }
 
   if (args[0] === "queue" && args[1] === "resume") {
-    const result = await resumeQueueRun(
-      paths,
-      parseRunPolicy(args.slice(2), "queue resume"),
-    );
-    process.stdout.write(
-      result === "started"
-        ? "Queue resumed.\n"
-        : result === "already-running"
-          ? "Queue is already running.\n"
-          : result === "paused"
-            ? "Queue is paused.\n"
-            : "Queue is idle.\n",
-    );
-    return 0;
+    return runManualQueueCommand(paths, "resume", args.slice(2));
   }
 
   if (args[0] === "queue" && args[1] === "status" && args.length === 2) {
@@ -159,7 +140,24 @@ async function main(args: string[]): Promise<number> {
 
   if (args[0] === "config" && args[1] === "show" && args.length === 2) {
     const config = await readConfiguration(paths.configPath);
-    process.stdout.write(`Continuation prompt: ${config.continuationPrompt}\n`);
+    process.stdout.write(
+      `Access Mode: ${renderAccessMode(config.accessMode)}\n`
+      + `Continuation prompt: ${config.continuationPrompt}\n`,
+    );
+    return 0;
+  }
+
+  if (
+    args[0] === "config"
+    && args[1] === "set"
+    && args[2] === "accessMode"
+    && (args[3] === "configured" || args[3] === "full")
+    && args.length === 4
+  ) {
+    await setAccessMode(paths, args[3]);
+    process.stdout.write(
+      `Access Mode updated to ${renderAccessMode(args[3])}.\n`,
+    );
     return 0;
   }
 
@@ -176,6 +174,30 @@ async function main(args: string[]): Promise<number> {
 
   process.stderr.write(usage);
   return 2;
+}
+
+async function runManualQueueCommand(
+  paths: DaemonPaths,
+  command: "resume" | "start",
+  args: string[],
+): Promise<number> {
+  const options = parseQueueRunOptions(args, `queue ${command}`);
+  const accessMode = (await readConfiguration(paths.configPath)).accessMode;
+  await acknowledgeAccessMode(accessMode, options.yes);
+  const result = command === "start"
+    ? await startQueueRun(paths, options.runPolicy, accessMode)
+    : await resumeQueueRun(paths, options.runPolicy, accessMode);
+  const message = result === "started"
+    ? `Queue ${command === "start" ? "started" : "resumed"}.`
+    : result === "already-running"
+      ? command === "start"
+        ? "Queue already has a running Task."
+        : "Queue is already running."
+      : result === "paused"
+        ? "Queue is paused."
+        : "Queue is idle.";
+  process.stdout.write(`${message}\n`);
+  return 0;
 }
 
 async function startDetached(paths: DaemonPaths): Promise<number> {
@@ -272,12 +294,21 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
         snapshot.queueRun.runPolicy === "until_idle" ? "Until Idle" : "Cutoff Time"
       }`,
     );
+    lines.push(
+      `  Access Mode ${renderAccessMode(snapshot.queueRun.accessMode)}`,
+    );
     lines.push(`  Started ${snapshot.queueRun.startedAt}`);
     if (snapshot.queueRun.cutoffTime) {
       lines.push(`  Cutoff Time ${snapshot.queueRun.cutoffTime}`);
     }
     if (snapshot.queueRun.endedAt) {
       lines.push(`  Ended ${snapshot.queueRun.endedAt}`);
+    }
+  }
+  if (snapshot.error) {
+    lines.push(`Error ${snapshot.error.code}: ${snapshot.error.message}`);
+    if (snapshot.error.details !== undefined) {
+      lines.push(`  Details ${JSON.stringify(snapshot.error.details)}`);
     }
   }
   for (const task of snapshot.tasks) {
@@ -295,6 +326,10 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
     }
   }
   return `${lines.join("\n")}\n`;
+}
+
+function renderAccessMode(accessMode: AccessMode): string {
+  return accessMode === "configured" ? "Configured Access" : "Full Access";
 }
 
 function renderPauseReason(reason: NonNullable<QueueSnapshot["pauseReason"]>): string {
@@ -375,6 +410,53 @@ function parseRunPolicy(args: string[], command: string): RunPolicy {
     }
   }
   throw new Error(`${command} requires --until-idle or --cutoff <timestamp>.`);
+}
+
+function parseQueueRunOptions(
+  args: string[],
+  command: string,
+): { runPolicy: RunPolicy; yes: boolean } {
+  const yesCount = args.filter((argument) => argument === "--yes").length;
+  if (yesCount > 1) throw new Error(`${command} accepts --yes only once.`);
+  return {
+    runPolicy: parseRunPolicy(
+      args.filter((argument) => argument !== "--yes"),
+      command,
+    ),
+    yes: yesCount === 1,
+  };
+}
+
+async function acknowledgeAccessMode(
+  accessMode: "configured" | "full",
+  yes: boolean,
+): Promise<void> {
+  if (accessMode === "configured") {
+    process.stderr.write(
+      "Configured Access uses your current Codex permissions; approvals may block unattended Queue Runs.\n",
+    );
+    return;
+  }
+
+  process.stderr.write(
+    "WARNING: Full Access allows Codex to modify the system and use the network without approval restrictions.\n",
+  );
+  if (yes) return;
+  if (!process.stdin.isTTY || !process.stderr.isTTY) {
+    throw new Error(
+      "Full Access requires explicit confirmation; rerun with --yes if you understand and accept the risk.",
+    );
+  }
+
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await prompt.question("Continue with Full Access? [y/N] ");
+    if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
+      throw new Error("Full Access was not confirmed.");
+    }
+  } finally {
+    prompt.close();
+  }
 }
 
 void main(process.argv.slice(2))

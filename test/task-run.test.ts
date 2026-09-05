@@ -34,14 +34,16 @@ async function createCliTestEnvironment(
     XDG_STATE_HOME: stateDir,
   };
   const runCli = async (...args: string[]): Promise<string> => {
-    const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], {
+    const { stdout } = await runCliResult(...args);
+    return stdout;
+  };
+  const runCliResult = (...args: string[]) =>
+    execFileAsync(process.execPath, [cliPath, ...args], {
       cwd: root,
       encoding: "utf8",
       env,
       timeout: 10_000,
     });
-    return stdout;
-  };
   const runCliWithInput = (input: string, ...args: string[]): Promise<string> =>
     new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [cliPath, ...args], {
@@ -67,11 +69,110 @@ async function createCliTestEnvironment(
     await runCli("daemon", "stop").catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   });
-  return { env, fakeCodex, root, runCli, runCliWithInput, stateDir, workspace };
+  return {
+    env,
+    fakeCodex,
+    root,
+    runCli,
+    runCliResult,
+    runCliWithInput,
+    stateDir,
+    workspace,
+  };
 }
 
+test("manual Queue Runs disclose and acknowledge their Access Mode", async (t) => {
+  const { runCli, runCliResult, workspace } = await createCliTestEnvironment(t, {
+    completeTurnSynchronously: true,
+  });
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Configured work");
+
+  const configured = await runCliResult("queue", "start", "--until-idle");
+  assert.match(configured.stderr, /Configured Access/);
+  assert.match(configured.stderr, /approvals may block unattended Queue Runs/i);
+
+  await runCli("config", "set", "accessMode", "full");
+  await runCli("task", "add", "--workspace", workspace, "Full Access work");
+  await assert.rejects(
+    runCliResult("queue", "resume", "--until-idle"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /Full Access allows Codex to modify the system/i);
+      assert.match(String(error.stderr), /rerun with --yes/i);
+      return true;
+    },
+  );
+
+  const full = await runCliResult("queue", "resume", "--until-idle", "--yes");
+  assert.equal(full.stdout, "Queue resumed.\n");
+  assert.match(full.stderr, /Full Access allows Codex to modify the system/i);
+});
+
+test("Configured Access clears sticky Full Access on a Managed Thread", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    codexApprovalPolicy: null,
+    codexSandboxMode: null,
+    codexSandboxWorkspaceWrite: null,
+    completeTurnSynchronously: true,
+  });
+  await runCli("daemon", "start");
+  await runCli("config", "set", "accessMode", "full");
+  await runCli("task", "add", "--workspace", workspace, "Elevated work");
+  await runCli("queue", "start", "--until-idle", "--yes");
+
+  await runCli("config", "set", "accessMode", "configured");
+  await runCli("task", "add", "--thread", "thread-fake", "Configured work");
+  await runCli("queue", "resume", "--until-idle");
+
+  const messages = (await readFile(fakeCodex.logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as {
+      message?: { method?: string; params?: Record<string, unknown> };
+    })
+    .map((record) => record.message)
+    .filter((message) => message?.method === "turn/start");
+  assert.deepEqual(messages.map((message) => ({
+    approvalPolicy: message?.params?.approvalPolicy,
+    sandboxPolicy: message?.params?.sandboxPolicy,
+  })), [
+    {
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "dangerFullAccess" },
+    },
+    {
+      approvalPolicy: null,
+      sandboxPolicy: null,
+    },
+  ]);
+});
+
+test("Configured Access explicitly disables network access for read-only sandboxes", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    codexSandboxMode: "read-only",
+    completeTurnSynchronously: true,
+  });
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Read-only work");
+  await runCli("queue", "start", "--until-idle");
+
+  const turnStart = (await readFile(fakeCodex.logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as {
+      message?: { method?: string; params?: Record<string, unknown> };
+    })
+    .map((record) => record.message)
+    .find((message) => message?.method === "turn/start");
+  assert.deepEqual(turnStart?.params?.sandboxPolicy, {
+    networkAccess: false,
+    type: "readOnly",
+  });
+});
+
 test("a Workspace Task runs once and completes without an output marker", async (t) => {
-  const { fakeCodex, runCli, stateDir, workspace } = await createCliTestEnvironment(t, {
+  const { fakeCodex, root, runCli, stateDir, workspace } = await createCliTestEnvironment(t, {
     completeTurnSynchronously: true,
   });
 
@@ -104,15 +205,32 @@ test("a Workspace Task runs once and completes without an output marker", async 
   const requests = records
     .filter((record) => record.type === "message")
     .map((record) => record.message)
-    .filter((message) => message?.method === "thread/start" || message?.method === "turn/start");
+    .filter((message) =>
+      message?.method === "thread/start"
+      || message?.method === "config/read"
+      || message?.method === "turn/start"
+    );
   assert.deepEqual(requests, [
     { method: "thread/start", id: 4, params: { cwd: workspace } },
     {
-      method: "turn/start",
+      method: "config/read",
       id: 5,
+      params: { cwd: workspace, includeLayers: false },
+    },
+    {
+      method: "turn/start",
+      id: 6,
       params: {
+        approvalPolicy: "on-request",
         threadId: "thread-fake",
         input: [{ type: "text", text: "Create a note" }],
+        sandboxPolicy: {
+          excludeSlashTmp: true,
+          excludeTmpdirEnvVar: false,
+          networkAccess: true,
+          type: "workspaceWrite",
+          writableRoots: [root],
+        },
       },
     },
   ]);

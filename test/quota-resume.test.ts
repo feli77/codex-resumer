@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
-import { CodexAppServer } from "../src/app-server.js";
+import { AppServerRpcError, CodexAppServer } from "../src/app-server.js";
+import type { AccessMode } from "../src/config.js";
 import {
   addManagedThreadTask,
   addWorkspaceTask,
+  DaemonRequestError,
   getQueueStatus,
   pauseQueue,
   resumeQueueRun,
@@ -82,6 +84,8 @@ class FakeAppServer implements AppServerController {
   readonly quotaPauseOnTurnNumbers = new Set<number>();
   readonly rateLimitReads: Array<Error | RateLimits> = [];
   readonly resumedThreads: string[] = [];
+  readonly turnStartErrors: Array<Error | undefined> = [];
+  readonly turnAccess: Array<{ accessMode: AccessMode; workspace: string }> = [];
   readonly turns: Array<{ prompt: string; threadId: string; turnId: string }> = [];
   startThreadCalls = 0;
   startThreadWait: Promise<void> | undefined;
@@ -111,9 +115,17 @@ class FakeAppServer implements AppServerController {
     return { threadId: "thread-quota" };
   }
 
-  async startTurn(threadId: string, prompt: string) {
+  async startTurn(
+    threadId: string,
+    prompt: string,
+    workspace?: string,
+    accessMode?: AccessMode,
+  ) {
+    const error = this.turnStartErrors.shift();
+    if (error) throw error;
     const turnId = `turn-${this.turns.length + 1}`;
     this.turns.push({ prompt, threadId, turnId });
+    if (workspace && accessMode) this.turnAccess.push({ accessMode, workspace });
     if (this.quotaPauseOnTurnNumbers.has(this.turns.length)) {
       this.emitUsageLimitExceeded(threadId, turnId);
     }
@@ -150,6 +162,29 @@ class FakeAppServer implements AppServerController {
   }
 }
 
+test("Full Access applies to every Task and Continuation in its Queue Run", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  appServer.rateLimitReads.push(
+    rateLimits({
+      codex: bucket("codex", "rate_limit_reached", 100, epoch("2026-09-04T10:05:00.000Z")),
+    }),
+    rateLimits({ codex: bucket("codex", null, 10, null) }),
+  );
+  await addWorkspaceTask(paths, workspace, "Continue with Full Access");
+
+  await startQueueRun(paths, { kind: "until_idle" }, "full");
+  appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
+  await waitForTaskState(paths, "waiting_for_quota");
+  clock.advanceTo("2026-09-04T10:05:02.000Z");
+  await waitForTurnCount(appServer, 2);
+
+  assert.deepEqual(appServer.turnAccess, [
+    { accessMode: "full", workspace },
+    { accessMode: "full", workspace },
+  ]);
+  assert.equal((await getQueueStatus(paths)).queueRun?.accessMode, "full");
+});
+
 test("an Until Idle Queue Run is persisted and visible through status", async (t) => {
   const { paths, workspace } = await createEnvironment(t);
 
@@ -158,6 +193,7 @@ test("an Until Idle Queue Run is persisted and visible through status", async (t
 
   const snapshot = await getQueueStatus(paths);
   assert.deepEqual(snapshot.queueRun, {
+    accessMode: "configured",
     id: 1,
     runPolicy: "until_idle",
     startedAt: "2026-09-04T10:00:00.000Z",
@@ -207,6 +243,7 @@ test("Cutoff Time pauses after the active Turn without starting the next Task", 
   assert.equal(snapshot.tasks[1]?.state, "queued");
   assert.equal(appServer.turns.length, 1);
   assert.deepEqual(snapshot.queueRun, {
+    accessMode: "configured",
     cutoffTime: "2026-09-04T10:05:00.000Z",
     endedAt: "2026-09-04T10:05:00.000Z",
     id: 1,
@@ -298,6 +335,42 @@ test("daemon restart cannot bypass an expired Cutoff Time", async (t) => {
     assert.equal(snapshot.queueRun?.endedAt, "2026-09-04T10:20:00.000Z");
     assert.equal(replacementAppServer.turns.length, 0);
     assert.equal(appServer.turns.length, 1);
+  } finally {
+    await replacement.daemon.close();
+  }
+});
+
+test("daemon restart preserves Full Access confirmation for a Continuation", async (t) => {
+  const { appServer, clock, daemon, paths, workspace } = await createEnvironment(t);
+  appServer.rateLimitReads.push(
+    rateLimits({
+      codex: bucket("codex", "rate_limit_reached", 100, epoch("2026-09-04T10:05:00.000Z")),
+    }),
+  );
+  await addWorkspaceTask(paths, workspace, "Resume after restart");
+  await startQueueRun(paths, { kind: "until_idle" }, "full");
+  appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
+  await waitForTaskState(paths, "waiting_for_quota");
+  await daemon.close();
+
+  const replacementAppServer = new FakeAppServer();
+  replacementAppServer.rateLimitReads.push(
+    rateLimits({ codex: bucket("codex", null, 10, null) }),
+  );
+  const replacement = await startDaemon({
+    appServer: replacementAppServer,
+    clock,
+    paths,
+  });
+  assert.equal(replacement.kind, "started");
+  if (replacement.kind !== "started") throw new Error("replacement did not start");
+  try {
+    clock.advanceTo("2026-09-04T10:05:02.000Z");
+    await waitForTurnCount(replacementAppServer, 1);
+    assert.deepEqual(replacementAppServer.turnAccess, [{
+      accessMode: "full",
+      workspace,
+    }]);
   } finally {
     await replacement.daemon.close();
   }
@@ -404,13 +477,179 @@ test("only structured UsageLimitExceeded errors emit a Quota Pause signal", asyn
   appServer.onUsageLimitExceeded((event) => events.push(event));
   const { threadId } = await appServer.startThread(root);
 
-  await appServer.startTurn(threadId, "first");
+  await appServer.startTurn(threadId, "first", root, "configured");
   await settle();
   assert.deepEqual(events, []);
 
-  await appServer.startTurn(threadId, "second");
+  await appServer.startTurn(threadId, "second", root, "configured");
   await settle();
   assert.deepEqual(events, [{ threadId, turnId: "turn-fake-2" }]);
+});
+
+test("an App Server Access Mode rejection remains structured and is not downgraded", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-access-error-test-"));
+  const rejection = {
+    code: -32012,
+    data: { reason: "sandbox mode denied by managed requirements" },
+    message: "requested sandbox policy is not allowed",
+  };
+  const fakeCodex = await createFakeCodex(root, { turnStartRpcError: rejection });
+  const appServer = new CodexAppServer({
+    command: fakeCodex.command,
+    env: { ...process.env, FAKE_CODEX_LOG: fakeCodex.logPath },
+  });
+  t.after(async () => {
+    await appServer.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  assert.equal((await appServer.startAndProbe()).state, "ready");
+  const { threadId } = await appServer.startThread(root);
+
+  await assert.rejects(
+    appServer.startTurn(threadId, "Do not downgrade access", root, "full"),
+    (error: unknown) => {
+      assert.ok(error instanceof AppServerRpcError);
+      assert.equal(error.method, "turn/start");
+      assert.equal(error.rpcCode, rejection.code);
+      assert.deepEqual(error.data, rejection.data);
+      return true;
+    },
+  );
+  const turnRequests = (await readFile(fakeCodex.logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { message?: { method?: string } })
+    .filter((record) => record.message?.method === "turn/start");
+  assert.equal(turnRequests.length, 1);
+});
+
+test("the daemon preserves a structured App Server permission rejection", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-daemon-access-error-test-"));
+  const workspace = path.join(root, "workspace");
+  await mkdir(workspace);
+  const paths = resolvePaths({
+    HOME: root,
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    XDG_RUNTIME_DIR: path.join(root, "runtime"),
+    XDG_STATE_HOME: path.join(root, "state"),
+  });
+  const rejection = {
+    code: -32012,
+    data: { reason: "sandbox mode denied by managed requirements" },
+    message: "requested sandbox policy is not allowed",
+  };
+  const fakeCodex = await createFakeCodex(root, { turnStartRpcError: rejection });
+  const appServer = new CodexAppServer({
+    command: fakeCodex.command,
+    env: { ...process.env, FAKE_CODEX_LOG: fakeCodex.logPath },
+  });
+  const result = await startDaemon({ appServer, paths });
+  assert.equal(result.kind, "started");
+  if (result.kind !== "started") throw new Error("daemon did not start");
+  t.after(async () => {
+    await result.daemon.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  await addWorkspaceTask(paths, workspace, "Keep the selected Access Mode");
+
+  await assert.rejects(
+    startQueueRun(paths, { kind: "until_idle" }, "full"),
+    (error: unknown) => {
+      assert.ok(error instanceof DaemonRequestError);
+      assert.equal(error.code, "app_server_rpc_error");
+      assert.deepEqual(error.details, {
+        data: rejection.data,
+        method: "turn/start",
+        rpcCode: rejection.code,
+      });
+      return true;
+    },
+  );
+  const snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "needs_attention");
+});
+
+test("an automatic Continuation persists a structured Access Mode rejection", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  const rejection = new AppServerRpcError(
+    "requested sandbox policy is not allowed",
+    "turn/start",
+    -32012,
+    { reason: "sandbox mode denied by managed requirements" },
+  );
+  appServer.turnStartErrors.push(undefined, rejection);
+  appServer.rateLimitReads.push(
+    rateLimits({
+      codex: bucket("codex", "rate_limit_reached", 100, epoch("2026-09-04T10:05:00.000Z")),
+    }),
+    rateLimits({ codex: bucket("codex", null, 10, null) }),
+  );
+  await addWorkspaceTask(paths, workspace, "Keep the confirmed Access Mode");
+  await startQueueRun(paths, { kind: "until_idle" }, "full");
+  appServer.emitUsageLimitExceeded("thread-quota", "turn-1");
+  await waitForTaskState(paths, "waiting_for_quota");
+
+  clock.advanceTo("2026-09-04T10:05:02.000Z");
+  const snapshot = await waitForSnapshot(
+    paths,
+    (candidate) => candidate.pauseReason === "needs_attention",
+  );
+
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "waiting_for_quota");
+  assert.deepEqual(
+    (snapshot as typeof snapshot & {
+      error?: { code: string; details?: unknown; message: string };
+    }).error,
+    {
+      code: "app_server_rpc_error",
+      details: {
+        data: { reason: "sandbox mode denied by managed requirements" },
+        method: "turn/start",
+        rpcCode: -32012,
+      },
+      message: "requested sandbox policy is not allowed",
+    },
+  );
+});
+
+test("automatic Queue advance persists a structured Access Mode rejection", async (t) => {
+  const { appServer, paths, workspace } = await createEnvironment(t);
+  const rejection = new AppServerRpcError(
+    "requested sandbox policy is not allowed",
+    "turn/start",
+    -32012,
+    { reason: "sandbox mode denied by managed requirements" },
+  );
+  appServer.turnStartErrors.push(undefined, rejection);
+  await addWorkspaceTask(paths, workspace, "Finish first");
+  await startQueueRun(paths, { kind: "until_idle" }, "full");
+  await addManagedThreadTask(paths, "thread-quota", "Reject second");
+
+  appServer.emitCompleted("thread-quota", "turn-1");
+  const snapshot = await waitForSnapshot(
+    paths,
+    (candidate) => candidate.pauseReason === "needs_attention",
+  );
+
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "completed");
+  assert.equal(snapshot.tasks[1]?.state, "queued");
+  assert.deepEqual(
+    (snapshot as typeof snapshot & {
+      error?: { code: string; details?: unknown; message: string };
+    }).error,
+    {
+      code: "app_server_rpc_error",
+      details: {
+        data: { reason: "sandbox mode denied by managed requirements" },
+        method: "turn/start",
+        rpcCode: -32012,
+      },
+      message: "requested sandbox policy is not allowed",
+    },
+  );
 });
 
 test("a missing reset time uses bounded exponential polling", async (t) => {
@@ -589,7 +828,7 @@ test("the global Continuation prompt has a default and can be replaced", async (
   };
   assert.equal(
     await runCli("config", "show"),
-    `Continuation prompt: ${DEFAULT_CONTINUATION_PROMPT}\n`,
+    `Access Mode: Configured Access\nContinuation prompt: ${DEFAULT_CONTINUATION_PROMPT}\n`,
   );
   const clock = new ManualClock("2026-09-04T10:00:00.000Z");
   const appServer = new FakeAppServer();
@@ -628,7 +867,8 @@ test("the global Continuation prompt has a default and can be replaced", async (
   );
   assert.equal(
     await runCli("config", "show"),
-    "Continuation prompt: Check what is unfinished, then carry on carefully.\n",
+    "Access Mode: Configured Access\n"
+      + "Continuation prompt: Check what is unfinished, then carry on carefully.\n",
   );
 });
 

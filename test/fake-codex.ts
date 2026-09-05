@@ -4,10 +4,19 @@ import path from "node:path";
 interface FakeCodexOptions {
   authenticated?: boolean;
   authRpcError?: boolean;
+  codexApprovalPolicy?: "never" | "on-request" | "untrusted" | null;
+  codexSandboxMode?: "danger-full-access" | "read-only" | "workspace-write" | null;
+  codexSandboxWorkspaceWrite?: {
+    exclude_slash_tmp?: boolean;
+    exclude_tmpdir_env_var?: boolean;
+    network_access?: boolean;
+    writable_roots?: string[];
+  } | null;
   completeTurn?: boolean;
   completeTurnSynchronously?: boolean;
   omitClientRequest?: string;
   omitRateLimitResetTime?: boolean;
+  turnStartRpcError?: { code: number; data?: unknown; message: string };
   turnCompletionDelayMs?: number;
   turnErrors?: Array<{ codexErrorInfo: string; message: string }>;
 }
@@ -25,6 +34,7 @@ export async function createFakeCodex(
     "initialize",
     "account/read",
     "account/rateLimits/read",
+    "config/read",
     "thread/start",
     "thread/resume",
     "thread/read",
@@ -143,6 +153,45 @@ if (args[0] === "app-server" && args[1] === "generate-json-schema") {
     "v2/TurnStartParams.json": {
       properties: properties("threadId", "input", "approvalPolicy", "sandboxPolicy"),
       required: ["threadId", "input"],
+      definitions: {
+        AskForApproval: { enum: ["untrusted", "on-request", "never"] },
+        SandboxPolicy: {
+          oneOf: [
+            { properties: { type: { enum: ["dangerFullAccess"] } } },
+            {
+              properties: {
+                networkAccess: { default: false, type: "boolean" },
+                type: { enum: ["readOnly"] },
+              },
+            },
+            {
+              properties: {
+                excludeSlashTmp: { default: false, type: "boolean" },
+                excludeTmpdirEnvVar: { default: false, type: "boolean" },
+                networkAccess: { default: false, type: "boolean" },
+                type: { enum: ["workspaceWrite"] },
+                writableRoots: { default: [], type: "array" },
+              },
+            },
+          ],
+        },
+      },
+    },
+    "v2/ConfigReadParams.json": {
+      properties: properties("cwd", "includeLayers"),
+    },
+    "v2/ConfigReadResponse.json": {
+      properties: properties("config", "origins"),
+      required: ["config", "origins"],
+      definitions: {
+        Config: {
+          properties: properties(
+            "approval_policy",
+            "sandbox_mode",
+            "sandbox_workspace_write",
+          ),
+        },
+      },
     },
     "v2/TurnInterruptParams.json": {
       properties: properties("threadId", "turnId"),
@@ -255,6 +304,24 @@ lines.on("line", (line) => {
       rateLimits: null,
       rateLimitsByLimitId: null,
     } }));
+  } else if (message.method === "config/read") {
+    console.log(JSON.stringify({ id: message.id, result: {
+      config: {
+        approval_policy: ${JSON.stringify(
+          options.codexApprovalPolicy === undefined ? "on-request" : options.codexApprovalPolicy,
+        )},
+        sandbox_mode: ${JSON.stringify(
+          options.codexSandboxMode === undefined ? "workspace-write" : options.codexSandboxMode,
+        )},
+        sandbox_workspace_write: ${JSON.stringify(options.codexSandboxWorkspaceWrite === undefined ? {
+          exclude_slash_tmp: true,
+          exclude_tmpdir_env_var: false,
+          network_access: true,
+          writable_roots: [root],
+        } : options.codexSandboxWorkspaceWrite)},
+      },
+      origins: {},
+    } }));
   } else if (message.method === "thread/start") {
     startedThreadCount += 1;
     const threadId = startedThreadCount === 1
@@ -296,6 +363,11 @@ lines.on("line", (line) => {
     };
     console.log(JSON.stringify({ id: message.id, result: { thread } }));
   } else if (message.method === "turn/start") {
+    const turnStartRpcError = ${JSON.stringify(options.turnStartRpcError)};
+    if (turnStartRpcError) {
+      console.log(JSON.stringify({ id: message.id, error: turnStartRpcError }));
+      return;
+    }
     turnCount += 1;
     const turnId = turnCount === 1 ? "turn-fake" : "turn-fake-" + turnCount;
     const turn = { id: turnId, status: "inProgress", items: [] };

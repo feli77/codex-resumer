@@ -12,9 +12,10 @@ import {
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
 import type { DaemonPaths } from "./paths.js";
-import { readConfiguration } from "./config.js";
+import { readConfiguration, type AccessMode } from "./config.js";
 import type { RunPolicy } from "./run-policy.js";
 import { StateStore, type QueueSnapshot } from "./state-store.js";
+import { serializeOperationalError } from "./structured-error.js";
 import { handleTaskRequest, TaskService } from "./task-service.js";
 
 export interface Clock {
@@ -50,7 +51,12 @@ export interface AppServerController {
   readThread(threadId: string): Promise<{ threadId: string; workspace: string }>;
   resumeThread(threadId: string): Promise<{ threadId: string }>;
   startThread(workspace: string): Promise<{ threadId: string }>;
-  startTurn(threadId: string, prompt: string): Promise<{ turnId: string }>;
+  startTurn(
+    threadId: string,
+    prompt: string,
+    workspace: string,
+    accessMode: AccessMode,
+  ): Promise<{ turnId: string }>;
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void;
   onUsageLimitExceeded(listener: (event: UsageLimitExceeded) => void): () => void;
   close(): Promise<void>;
@@ -96,6 +102,17 @@ export type DaemonStatus =
 
 export interface RunningDaemon {
   close(): Promise<void>;
+}
+
+export class DaemonRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly details: unknown,
+  ) {
+    super(message);
+    this.name = "DaemonRequestError";
+  }
 }
 
 export type StartDaemonResult =
@@ -291,23 +308,29 @@ export async function cancelTask(paths: DaemonPaths, taskId: number): Promise<vo
 export async function startQueueRun(
   paths: DaemonPaths,
   runPolicy: RunPolicy,
+  accessMode: AccessMode = "configured",
 ): Promise<QueueRunStartState> {
-  return beginQueueRun(paths, "queue/start", runPolicy);
+  return beginQueueRun(paths, "queue/start", runPolicy, accessMode);
 }
 
 export async function resumeQueueRun(
   paths: DaemonPaths,
   runPolicy: RunPolicy,
+  accessMode: AccessMode = "configured",
 ): Promise<QueueRunStartState> {
-  return beginQueueRun(paths, "queue/resume", runPolicy);
+  return beginQueueRun(paths, "queue/resume", runPolicy, accessMode);
 }
 
 async function beginQueueRun(
   paths: DaemonPaths,
   method: "queue/resume" | "queue/start",
   runPolicy: RunPolicy,
+  accessMode: AccessMode,
 ): Promise<QueueRunStartState> {
-  const result = await requestResult(paths.socketPath, { method, params: { runPolicy } });
+  const result = await requestResult(paths.socketPath, {
+    method,
+    params: { accessMode, runPolicy },
+  });
   if (
     !isRecord(result)
     || (
@@ -488,7 +511,7 @@ function handleConnection(
         void handleTaskRequest(request, taskService)
           .then((result) => socket.end(`${JSON.stringify({ result })}\n`))
           .catch((error: unknown) => {
-            socket.end(`${JSON.stringify({ error: errorMessage(error) })}\n`);
+            socket.end(`${JSON.stringify({ error: serializeOperationalError(error) })}\n`);
           });
       }
     } catch {
@@ -587,6 +610,17 @@ async function requestResult(
 ): Promise<unknown> {
   const response = await sendRequest(socketPath, request);
   if (typeof response.error === "string") throw new Error(response.error);
+  if (
+    isRecord(response.error)
+    && typeof response.error.code === "string"
+    && typeof response.error.message === "string"
+  ) {
+    throw new DaemonRequestError(
+      response.error.message,
+      response.error.code,
+      response.error.details,
+    );
+  }
   return response.result;
 }
 
@@ -602,6 +636,14 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
     && value.pauseReason !== "cutoff_reached"
     && value.pauseReason !== "needs_attention"
     && value.pauseReason !== "run_policy_required"
+  ) return false;
+  if (
+    value.error !== undefined
+    && (
+      !isRecord(value.error)
+      || typeof value.error.code !== "string"
+      || typeof value.error.message !== "string"
+    )
   ) return false;
   if (value.queueRun !== undefined && !isQueueRunSummary(value.queueRun)) return false;
   return value.tasks.every((task) =>
@@ -626,6 +668,7 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
 function isQueueRunSummary(value: unknown): boolean {
   return isRecord(value)
     && typeof value.id === "number"
+    && (value.accessMode === "configured" || value.accessMode === "full")
     && (value.runPolicy === "until_idle" || value.runPolicy === "cutoff_time")
     && typeof value.startedAt === "string"
     && (value.cutoffTime === undefined || typeof value.cutoffTime === "string")

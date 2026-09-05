@@ -59,6 +59,34 @@ codex-resumer queue pause
 codex-resumer queue resume --until-idle
 ```
 
+The global Access Mode defaults to Configured Access. On every Turn, Configured
+Access reads the effective Codex sandbox and approval settings for that
+Workspace and sends them explicitly to App Server. Manual Queue starts and
+resumes warn that an approval can block unattended work.
+
+Full Access removes Codex sandbox and approval restrictions for every Task and
+Continuation in the Queue Run. It can modify files outside the Workspace and
+use the network without asking. Select it globally, then acknowledge that risk
+on every manual start or resume. `--yes` is the explicit non-interactive
+acknowledgement:
+
+```sh
+codex-resumer config set accessMode full
+codex-resumer queue start --until-idle --yes
+```
+
+To return to the user's effective Codex permissions for the next Queue Run:
+
+```sh
+codex-resumer config set accessMode configured
+codex-resumer queue resume --until-idle
+```
+
+The selected Access Mode is stored with the Queue Run. Automatic Continuations
+and unexpected daemon recovery reuse that selection without asking again. A
+permission policy rejected by App Server fails clearly and is never replaced
+with a different policy.
+
 Manual pause lets an active Turn finish but prevents the next Task or
 Continuation from starting. Resume creates a new Queue Run and requires a new
 Run Policy selection. At Cutoff Time, the Queue is paused without interrupting
@@ -112,7 +140,8 @@ completes the Task and starts the next queued Task; no marker is required in the
 model output. Every Workspace target creates a new Thread. Imported Threads are
 validated with App Server and permanently bound to their recorded Workspace.
 New Threads and Turns omit model, reasoning, and personality overrides, so Codex
-uses the user's current defaults.
+uses the user's current defaults. Codex Resumer also leaves service tier,
+credits, API keys, and authentication unchanged.
 
 When App Server reports a structured `usageLimitExceeded` error, the active Task
 enters `waiting_for_quota` while retaining its Managed Thread and failed Turn.
@@ -122,7 +151,10 @@ continues. If no reset time is available, it polls with exponential delays from 
 minute up to a fifteen-minute cap. A recovered Task starts a new Turn in the same
 Managed Thread with the current global Continuation prompt; the original Task prompt
 is never submitted again. Repeated Quota Pauses follow the same process until the
-Task completes, the Queue is manually paused, or its Cutoff Time is reached.
+Task completes, the Queue is manually paused, or its Cutoff Time is reached. If
+App Server rejects the confirmed Access Mode during an automatic Continuation,
+Codex Resumer pauses the Queue as `Needs Attention` and persists the structured
+RPC error for `queue status`; it does not retry with weaker permissions.
 
 `daemon start` detaches from the terminal. Starting it again is safe and keeps a
 single daemon instance. At startup, Codex Resumer checks the installed protocol
@@ -146,4 +178,5 @@ Codex Resumer follows the Linux XDG base-directory convention:
 Application directories are mode `0700`; the Unix domain socket and daemon
 status file are mode `0600`. Queue, Task, Managed Thread, and Turn state is kept
 in `state.sqlite3` inside the state directory. Complete prompts are removed from
-the database when their Task completes.
+the database when their Task completes. The global configuration exposes only
+`accessMode` and `continuationPrompt`.
