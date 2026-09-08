@@ -266,6 +266,17 @@ export class StateStore {
     return this.#database.transaction(() => {
       const state = this.#queueRunState(now);
       if (state.kind !== "running") return undefined;
+      if (this.#markDeferredRetryNeedsAttention()) {
+        this.#pauseQueue(
+          "needs_attention",
+          now,
+          {
+            code: "transient_retry_interrupted",
+            message: "The daemon stopped while waiting to retry a transient failure.",
+          },
+        );
+        return undefined;
+      }
       const activeRun = state.queueRun;
       if (activeRun.cutoff_time === null) {
         return {
@@ -554,11 +565,18 @@ export class StateStore {
     status: "completed" | "failed" | "interrupted",
     now: Date,
   ): void {
-    this.#database.prepare(`
-      UPDATE turns SET state = ?, completed_at = ?
-      WHERE managed_thread_id = ? AND id = ?
-        AND state IN ('in_progress', 'quota_paused')
-    `).run(status, now.toISOString(), managedThreadId, turnId);
+    this.#database.transaction(() => {
+      const result = this.#database.prepare(`
+        UPDATE turns SET state = ?, completed_at = ?
+        WHERE managed_thread_id = ? AND id = ?
+          AND state IN ('in_progress', 'quota_paused')
+      `).run(status, now.toISOString(), managedThreadId, turnId);
+      if (result.changes === 1) {
+        this.#database.prepare(`
+          UPDATE managed_threads SET state = 'idle' WHERE id = ?
+        `).run(managedThreadId);
+      }
+    })();
   }
 
   recordQuotaPause(
@@ -792,15 +810,17 @@ export class StateStore {
 
   recordUnattendedRequest(
     managedThreadId: string,
-    turnId: string,
+    turnId: string | undefined,
     error: StructuredError,
     now: Date,
   ): boolean {
     return this.#database.transaction(() => {
       const task = this.#database.prepare(`
         SELECT id FROM tasks
-        WHERE managed_thread_id = ? AND active_turn_id = ? AND state = 'running'
-      `).get(managedThreadId, turnId) as { id: number } | undefined;
+        WHERE managed_thread_id = ? AND state = 'running'
+          AND (? IS NULL OR active_turn_id = ?)
+      `).get(managedThreadId, turnId ?? null, turnId ?? null) as
+        { id: number } | undefined;
       if (!task) return false;
       this.#database.prepare(`
         UPDATE tasks SET state = 'needs_attention' WHERE id = ?
@@ -1207,13 +1227,14 @@ export class StateStore {
     `);
   }
 
-  #markDeferredRetryNeedsAttention(): void {
-    this.#database.prepare(`
+  #markDeferredRetryNeedsAttention(): boolean {
+    const result = this.#database.prepare(`
       UPDATE tasks
       SET state = 'needs_attention'
       WHERE state = 'running'
         AND active_turn_id IN (SELECT id FROM turns WHERE state = 'failed')
     `).run();
+    return result.changes > 0;
   }
 
   #queueRunState(now: Date): PersistedQueueRunState {
@@ -1227,6 +1248,7 @@ export class StateStore {
       activeRun.cutoff_time !== null
       && new Date(activeRun.cutoff_time).getTime() <= now.getTime()
     ) {
+      this.#markDeferredRetryNeedsAttention();
       this.#pauseQueue("cutoff_reached", now);
       return { kind: "paused" };
     }

@@ -207,6 +207,7 @@ export class TaskService {
       },
       this.clock.now(),
     )) {
+      if (request.turnId === undefined) return;
       if (this.store.hasTurn(request.threadId, request.turnId)) return;
       this.#unattendedBeforeTurnStart = request;
     }

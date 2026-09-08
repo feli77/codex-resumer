@@ -571,7 +571,10 @@ export class CodexAppServer implements AppServerController {
     }
     if (!isRecord(message)) return;
     const unattendedRequest = parseUnattendedRequest(message);
-    if (unattendedRequest && typeof message.id === "number") {
+    if (
+      unattendedRequest
+      && (typeof message.id === "number" || typeof message.id === "string")
+    ) {
       this.#respond(message.id, safeUnattendedResponse(unattendedRequest.kind));
       for (const listener of this.#unattendedRequestListeners) {
         listener(unattendedRequest);
@@ -629,7 +632,7 @@ export class CodexAppServer implements AppServerController {
     this.#pending.clear();
   }
 
-  #respond(id: number, result: unknown): void {
+  #respond(id: number | string, result: unknown): void {
     this.#child?.stdin.write(`${JSON.stringify({ id, result })}\n`);
   }
 }
@@ -858,7 +861,7 @@ function parseUnattendedRequest(value: Record<string, unknown>):
   UnattendedRequest | undefined {
   if (!isRecord(value.params)) return undefined;
   const { threadId, turnId } = value.params;
-  if (typeof threadId !== "string" || typeof turnId !== "string") return undefined;
+  if (typeof threadId !== "string") return undefined;
   const kinds: Record<string, UnattendedRequestKind> = {
     "item/commandExecution/requestApproval": "command_approval",
     "item/fileChange/requestApproval": "file_change_approval",
@@ -867,7 +870,13 @@ function parseUnattendedRequest(value: Record<string, unknown>):
     "mcpServer/elicitation/request": "mcp_elicitation",
   };
   const kind = typeof value.method === "string" ? kinds[value.method] : undefined;
-  return kind ? { kind, threadId, turnId } : undefined;
+  return kind
+    ? {
+      kind,
+      threadId,
+      ...(typeof turnId === "string" ? { turnId } : {}),
+    }
+    : undefined;
 }
 
 function safeUnattendedResponse(kind: UnattendedRequestKind): unknown {

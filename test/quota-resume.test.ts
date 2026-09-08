@@ -6,6 +6,8 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
+import Database from "better-sqlite3";
+
 import { AppServerRpcError, CodexAppServer } from "../src/app-server.js";
 import type { AccessMode } from "../src/config.js";
 import {
@@ -196,6 +198,16 @@ class FakeAppServer implements AppServerController {
         turnId,
       });
     }
+  }
+
+  emitInterrupted(threadId: string, turnId: string): void {
+    for (const listener of this.#completedListeners) {
+      listener({ status: "interrupted", threadId, turnId });
+    }
+  }
+
+  emitUnattended(request: UnattendedRequest): void {
+    for (const listener of this.#unattendedRequestListeners) listener(request);
   }
 }
 
@@ -558,10 +570,13 @@ test("unattended App Server requests are safely rejected and never approved", as
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line) as {
-      message?: { id?: number; result?: unknown };
+      message?: { id?: number | string; result?: unknown };
     })
     .map((record) => record.message)
-    .filter((message) => (message?.id ?? 0) >= 1000);
+    .filter((message) =>
+      typeof message?.id === "string"
+      || (typeof message?.id === "number" && message.id >= 1000)
+    );
   assert.deepEqual(requests, [
     "command_approval",
     "file_change_approval",
@@ -574,11 +589,38 @@ test("unattended App Server requests are safely rejected and never approved", as
     { id: 1001, result: { decision: "cancel" } },
     { id: 1002, result: { permissions: {} } },
     { id: 1003, result: { answers: {} } },
-    { id: 1004, result: { action: "cancel" } },
+    { id: "request-mcp", result: { action: "cancel" } },
   ]);
   assert.equal(
     JSON.stringify(responses).includes("accept"),
     false,
+  );
+});
+
+test("an unattended Turn returning a terminal event releases its Managed Thread", async (t) => {
+  const { appServer, paths, workspace } = await createEnvironment(t);
+  await addWorkspaceTask(paths, workspace, "Wait for a human");
+  await startQueueRun(paths, { kind: "until_idle" });
+
+  appServer.emitUnattended({
+    kind: "user_input",
+    threadId: "thread-quota",
+    turnId: "turn-1",
+  });
+  await waitForTaskState(paths, "needs_attention");
+  appServer.emitInterrupted("thread-quota", "turn-1");
+  await settle();
+
+  const database = new Database(paths.databasePath, { readonly: true });
+  t.after(() => database.close());
+  assert.deepEqual(
+    database.prepare("SELECT state FROM managed_threads WHERE id = ?")
+      .get("thread-quota"),
+    { state: "idle" },
+  );
+  assert.deepEqual(
+    database.prepare("SELECT state FROM turns WHERE id = ?").get("turn-1"),
+    { state: "interrupted" },
   );
 });
 
@@ -782,6 +824,34 @@ test("pausing during transient backoff leaves the Task explicitly resolvable", a
     resumeQueueRun(paths, { kind: "until_idle" }),
     /Resolve Task 1 before resuming the Queue/,
   );
+});
+
+test("daemon restart during transient backoff becomes Needs Attention", async (t) => {
+  const { appServer, clock, daemon, paths, workspace } = await createEnvironment(t);
+  await addWorkspaceTask(paths, workspace, "Original work");
+  await startQueueRun(paths, { kind: "until_idle" });
+
+  appServer.emitFailed("thread-quota", "turn-1", "serverOverloaded", "busy");
+  await waitForScheduledWaitCount(clock, 1);
+  await daemon.close();
+
+  const replacementAppServer = new FakeAppServer();
+  const replacement = await startDaemon({
+    appServer: replacementAppServer,
+    clock,
+    paths,
+  });
+  assert.equal(replacement.kind, "started");
+  if (replacement.kind !== "started") throw new Error("replacement did not start");
+  try {
+    const snapshot = await getQueueStatus(paths);
+    assert.equal(snapshot.state, "paused");
+    assert.equal(snapshot.pauseReason, "needs_attention");
+    assert.equal(snapshot.tasks[0]?.state, "needs_attention");
+    assert.equal(replacementAppServer.turns.length, 0);
+  } finally {
+    await replacement.daemon.close();
+  }
 });
 
 test("automatic Queue advance persists a structured Access Mode rejection", async (t) => {

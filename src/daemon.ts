@@ -55,7 +55,7 @@ export type UnattendedRequestKind =
 export interface UnattendedRequest {
   kind: UnattendedRequestKind;
   threadId: string;
-  turnId: string;
+  turnId?: string;
 }
 
 export interface StartedTurn {

@@ -410,7 +410,7 @@ lines.on("line", (line) => {
       setImmediate(() => process.exit(17));
     } else if (unattendedRequestMethods.length > 0) {
       const requests = unattendedRequestMethods.map((method, index) => JSON.stringify({
-        id: 1000 + index,
+        id: method === "mcpServer/elicitation/request" ? "request-mcp" : 1000 + index,
         method,
         params: {
           itemId: "item-" + index,
@@ -418,7 +418,7 @@ lines.on("line", (line) => {
           permissions: {},
           serverName: "fake-mcp",
           threadId: message.params.threadId,
-          turnId,
+          turnId: method === "mcpServer/elicitation/request" ? null : turnId,
         },
       }));
       process.stdout.write([response, ...requests].join("\\n") + "\\n");
