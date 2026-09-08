@@ -16,12 +16,16 @@ import { createFakeCodex } from "./fake-codex.js";
 
 const unusedTaskExecution: Pick<
   AppServerController,
+  | "interruptTurn"
   | "readRateLimits"
   | "readThread"
   | "resumeThread"
   | "startThread"
   | "startTurn"
   | "onTurnCompleted"
+  | "onTurnStarted"
+  | "onUnattendedRequest"
+  | "onUnexpectedExit"
   | "onUsageLimitExceeded"
 > = {
   async readRateLimits() {
@@ -39,7 +43,19 @@ const unusedTaskExecution: Pick<
   async startTurn() {
     throw new Error("not used by daemon lifecycle tests");
   },
+  async interruptTurn() {
+    throw new Error("not used by daemon lifecycle tests");
+  },
   onTurnCompleted() {
+    return () => undefined;
+  },
+  onTurnStarted() {
+    return () => undefined;
+  },
+  onUnattendedRequest() {
+    return () => undefined;
+  },
+  onUnexpectedExit() {
     return () => undefined;
   },
   onUsageLimitExceeded() {

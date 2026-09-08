@@ -45,6 +45,24 @@ export interface UsageLimitExceeded {
   turnId: string;
 }
 
+export type UnattendedRequestKind =
+  | "command_approval"
+  | "file_change_approval"
+  | "permission_request"
+  | "user_input"
+  | "mcp_elicitation";
+
+export interface UnattendedRequest {
+  kind: UnattendedRequestKind;
+  threadId: string;
+  turnId: string;
+}
+
+export interface StartedTurn {
+  threadId: string;
+  turnId: string;
+}
+
 export interface AppServerController {
   startAndProbe(): Promise<AppServerProbeResult>;
   readRateLimits(): Promise<AccountRateLimits>;
@@ -57,15 +75,25 @@ export interface AppServerController {
     workspace: string,
     accessMode: AccessMode,
   ): Promise<{ turnId: string }>;
+  interruptTurn(threadId: string, turnId: string): Promise<void>;
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void;
+  onTurnStarted(listener: (turn: StartedTurn) => void): () => void;
+  onUnattendedRequest(listener: (request: UnattendedRequest) => void): () => void;
+  onUnexpectedExit(listener: (error: Error) => void): () => void;
   onUsageLimitExceeded(listener: (event: UsageLimitExceeded) => void): () => void;
   close(): Promise<void>;
 }
 
 export interface CompletedTurn {
+  error?: TurnError;
   status: "completed" | "failed" | "interrupted";
   threadId: string;
   turnId: string;
+}
+
+export interface TurnError {
+  codexErrorInfo?: unknown;
+  message: string;
 }
 
 export type AppServerProbeResult =
@@ -189,6 +217,15 @@ export async function startDaemon({
     const unsubscribeTurnCompleted = appServer.onTurnCompleted((turn) => {
       taskService.handleTurnCompleted(turn);
     });
+    const unsubscribeTurnStarted = appServer.onTurnStarted((turn) => {
+      taskService.handleTurnStarted(turn);
+    });
+    const unsubscribeUnattendedRequest = appServer.onUnattendedRequest((request) => {
+      taskService.handleUnattendedRequest(request);
+    });
+    const unsubscribeUnexpectedExit = appServer.onUnexpectedExit((error) => {
+      taskService.handleAppServerExit(error);
+    });
     const unsubscribeUsageLimit = appServer.onUsageLimitExceeded((event) => {
       taskService.handleUsageLimitExceeded(event);
     });
@@ -202,7 +239,13 @@ export async function startDaemon({
         daemonLock,
         store,
         taskService,
-        [unsubscribeTurnCompleted, unsubscribeUsageLimit],
+        [
+          unsubscribeTurnCompleted,
+          unsubscribeTurnStarted,
+          unsubscribeUnattendedRequest,
+          unsubscribeUnexpectedExit,
+          unsubscribeUsageLimit,
+        ],
       );
       return closing;
     };
@@ -214,6 +257,9 @@ export async function startDaemon({
       await listen(server, paths.socketPath);
     } catch (error) {
       unsubscribeTurnCompleted();
+      unsubscribeTurnStarted();
+      unsubscribeUnattendedRequest();
+      unsubscribeUnexpectedExit();
       unsubscribeUsageLimit();
       store.close();
       await appServer.close();
@@ -302,6 +348,30 @@ export async function cancelTask(paths: DaemonPaths, taskId: number): Promise<vo
   });
   if (!isRecord(result) || result.taskId !== taskId) {
     throw new Error("daemon returned an invalid Task cancellation result");
+  }
+}
+
+export async function retryTask(
+  paths: DaemonPaths,
+  taskId: number,
+  prompt: string,
+): Promise<void> {
+  const result = await requestResult(paths.socketPath, {
+    method: "task/retry",
+    params: { taskId, prompt },
+  });
+  if (!isRecord(result) || result.taskId !== taskId) {
+    throw new Error("daemon returned an invalid Task retry result");
+  }
+}
+
+export async function completeTask(paths: DaemonPaths, taskId: number): Promise<void> {
+  const result = await requestResult(paths.socketPath, {
+    method: "task/complete",
+    params: { taskId },
+  });
+  if (!isRecord(result) || result.taskId !== taskId) {
+    throw new Error("daemon returned an invalid manual Task completion result");
   }
 }
 
@@ -654,6 +724,7 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
       task.state === "queued"
       || task.state === "running"
       || task.state === "waiting_for_quota"
+      || task.state === "needs_attention"
       || task.state === "completed"
       || task.state === "cancelled"
     )

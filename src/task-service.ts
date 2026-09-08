@@ -11,6 +11,8 @@ import type {
   Clock,
   CompletedTurn,
   RateLimitSnapshot,
+  StartedTurn,
+  UnattendedRequest,
   UsageLimitExceeded,
 } from "./daemon.js";
 import {
@@ -19,11 +21,13 @@ import {
   type QueuedTask,
   type QuotaPause,
   type QuotaPauseDetails,
+  type TransientRetry,
 } from "./state-store.js";
 
 const QUOTA_RESET_SAFETY_MS = 2_000;
 const QUOTA_POLL_INITIAL_MS = 60_000;
 const QUOTA_POLL_MAX_MS = 15 * 60_000;
+const TRANSIENT_RETRY_INITIAL_MS = 1_000;
 
 export class TaskService {
   #automaticAdvance: Promise<void> = Promise.resolve();
@@ -31,6 +35,10 @@ export class TaskService {
   #completionBeforeTurnStart: CompletedTurn | undefined;
   #quotaBeforeTurnStart: UsageLimitExceeded | undefined;
   #quotaRecovery: Promise<void> = Promise.resolve();
+  #transientRetry: Promise<void> = Promise.resolve();
+  #unattendedBeforeTurnStart: UnattendedRequest | undefined;
+  #turnStartsInProgress = new Set<string>();
+  #startedBeforeTurnRecorded: StartedTurn[] = [];
   readonly #stopping = new AbortController();
 
   constructor(
@@ -138,26 +146,94 @@ export class TaskService {
     return { taskId };
   }
 
-  cancel(taskId: number): { taskId: number } {
-    this.store.cancelQueuedTask(taskId, this.clock.now());
+  async cancel(taskId: number): Promise<{ taskId: number }> {
+    const cancellation = this.store.cancelTask(taskId, this.clock.now());
+    if (cancellation.interrupt) {
+      await this.appServer.interruptTurn(
+        cancellation.interrupt.threadId,
+        cancellation.interrupt.turnId,
+      );
+    }
+    return { taskId };
+  }
+
+  retry(taskId: number, prompt: string): { taskId: number } {
+    if (prompt.trim().length === 0) {
+      throw new Error("New retry prompt must not be empty.");
+    }
+    this.store.retryNeedsAttentionTask(taskId, prompt);
+    return { taskId };
+  }
+
+  complete(taskId: number): { taskId: number } {
+    this.store.completeNeedsAttentionTask(taskId, this.clock.now());
     return { taskId };
   }
 
   handleTurnCompleted(turn: CompletedTurn): void {
-    if (turn.status !== "completed") return;
-    if (!this.store.completeTurn(turn.threadId, turn.turnId, this.clock.now())) {
+    if (!this.store.hasActiveTurn(turn.threadId, turn.turnId)) {
+      if (this.store.hasTurn(turn.threadId, turn.turnId)) {
+        this.store.recordInactiveTurnCompletion(
+          turn.threadId,
+          turn.turnId,
+          turn.status,
+          this.clock.now(),
+        );
+        return;
+      }
       this.#completionBeforeTurnStart = turn;
-    } else {
-      this.#scheduleAutomaticAdvance();
+      return;
     }
+    this.#finishTurn(turn);
   }
 
   handleUsageLimitExceeded(event: UsageLimitExceeded): void {
     if (!this.store.hasActiveTurn(event.threadId, event.turnId)) {
+      if (this.store.hasTurn(event.threadId, event.turnId)) return;
       this.#quotaBeforeTurnStart = event;
       return;
     }
     this.#scheduleQuotaPause(event);
+  }
+
+  handleUnattendedRequest(request: UnattendedRequest): void {
+    if (!this.store.recordUnattendedRequest(
+      request.threadId,
+      request.turnId,
+      {
+        code: "unattended_request",
+        details: { requestType: request.kind },
+        message: unattendedRequestMessage(request.kind),
+      },
+      this.clock.now(),
+    )) {
+      if (this.store.hasTurn(request.threadId, request.turnId)) return;
+      this.#unattendedBeforeTurnStart = request;
+    }
+  }
+
+  handleAppServerExit(error: Error): void {
+    if (this.#stopping.signal.aborted) return;
+    this.store.recordActiveTaskNeedsAttention(
+      {
+        code: "app_server_process_exit",
+        message: error.message,
+      },
+      this.clock.now(),
+    );
+  }
+
+  handleTurnStarted(turn: StartedTurn): void {
+    if (this.store.hasActiveTurn(turn.threadId, turn.turnId)) return;
+    if (this.#turnStartsInProgress.has(turn.threadId)) {
+      this.#startedBeforeTurnRecorded.push(turn);
+      return;
+    }
+    this.store.recordExternalThreadActivity(
+      turn.threadId,
+      turn.turnId,
+      this.clock.now(),
+    );
   }
 
   async dispatch(task: QueuedTask): Promise<boolean> {
@@ -173,15 +249,37 @@ export class TaskService {
       this.store.releaseUndispatchedTask(task.id);
       return false;
     }
-    const { turnId } = await this.appServer.startTurn(
+    await this.#startOwnedTurn(
       threadId,
       task.prompt,
       task.workspace,
-      this.#requiredAccessMode(),
+      (turnId) => {
+        this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
+        return true;
+      },
     );
-    this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
-    this.#reconcileTurnStart(threadId, turnId);
     return true;
+  }
+
+  async #startOwnedTurn(
+    threadId: string,
+    prompt: string,
+    workspace: string,
+    recordStarted: (turnId: string) => boolean,
+  ): Promise<void> {
+    this.#turnStartsInProgress.add(threadId);
+    try {
+      const { turnId } = await this.appServer.startTurn(
+        threadId,
+        prompt,
+        workspace,
+        this.#requiredAccessMode(),
+      );
+      if (!recordStarted(turnId)) return;
+      this.#reconcileTurnStart(threadId, turnId);
+    } finally {
+      this.#turnStartsInProgress.delete(threadId);
+    }
   }
 
   #reconcileTurnStart(threadId: string, turnId: string): void {
@@ -193,9 +291,104 @@ export class TaskService {
     const completion = this.#completionBeforeTurnStart;
     if (completion?.threadId === threadId && completion.turnId === turnId) {
       this.#completionBeforeTurnStart = undefined;
-      this.store.completeTurn(threadId, turnId, this.clock.now());
-      this.#scheduleAutomaticAdvance();
+      this.#finishTurn(completion);
     }
+    const unattended = this.#unattendedBeforeTurnStart;
+    if (unattended?.threadId === threadId && unattended.turnId === turnId) {
+      this.#unattendedBeforeTurnStart = undefined;
+      this.handleUnattendedRequest(unattended);
+    }
+    const earlyStarts = this.#startedBeforeTurnRecorded.filter(
+      (started) => started.threadId === threadId,
+    );
+    this.#startedBeforeTurnRecorded = this.#startedBeforeTurnRecorded.filter(
+      (started) => started.threadId !== threadId,
+    );
+    for (const started of earlyStarts) {
+      if (started.turnId !== turnId) {
+        this.store.recordExternalThreadActivity(
+          started.threadId,
+          started.turnId,
+          this.clock.now(),
+        );
+      }
+    }
+  }
+
+  #finishTurn(turn: CompletedTurn): void {
+    if (turn.status === "completed") {
+      if (this.store.completeTurn(turn.threadId, turn.turnId, this.clock.now())) {
+        this.#scheduleAutomaticAdvance();
+      }
+      return;
+    }
+    if (turn.error?.codexErrorInfo === "usageLimitExceeded") {
+      this.handleUsageLimitExceeded({ threadId: turn.threadId, turnId: turn.turnId });
+      return;
+    }
+    if (isTransientFailure(turn.error?.codexErrorInfo)) {
+      const retry = this.store.recordTransientFailure(
+        turn.threadId,
+        turn.turnId,
+        this.clock.now(),
+      );
+      if (retry && retry !== "exhausted") {
+        this.#scheduleTransientRetry(retry);
+        return;
+      }
+    }
+    this.store.recordTurnNeedsAttention(
+      turn.threadId,
+      turn.turnId,
+      turn.status,
+      {
+        code: "turn_failed",
+        ...(turn.error?.codexErrorInfo === undefined
+          ? {}
+          : { details: { codexErrorInfo: turn.error.codexErrorInfo } }),
+        message: turn.error?.message
+          ?? `Codex Turn ${turn.status}; user action is required.`,
+      },
+      this.clock.now(),
+    );
+  }
+
+  #scheduleTransientRetry(retry: TransientRetry): void {
+    this.#transientRetry = this.#transientRetry
+      .then(async () => {
+        await waitUntil(
+          this.clock,
+          new Date(
+            this.clock.now().getTime()
+              + TRANSIENT_RETRY_INITIAL_MS * 2 ** (retry.attempt - 1),
+          ),
+          this.#stopping.signal,
+        );
+        if (this.#stopping.signal.aborted || !this.store.isQueueRunning()) return;
+        const { threadId } = await this.appServer.resumeThread(retry.threadId);
+        this.store.activateManagedThread(threadId);
+        const prompt = await this.continuationPrompt();
+        if (!this.store.canStartTurn(this.clock.now())) return;
+        await this.#startOwnedTurn(
+          threadId,
+          prompt,
+          retry.workspace,
+          (turnId) => this.store.recordTransientRetryStarted(
+            retry.taskId,
+            threadId,
+            turnId,
+            this.clock.now(),
+          ),
+        );
+      })
+      .catch((error: unknown) => {
+        if (this.#stopping.signal.aborted) return;
+        this.store.recordTaskNeedsAttention(
+          retry.taskId,
+          serializeOperationalError(error),
+          this.clock.now(),
+        );
+      });
   }
 
   close(): void {
@@ -270,19 +463,17 @@ export class TaskService {
     this.store.activateManagedThread(threadId);
     const prompt = await this.continuationPrompt();
     if (!this.store.canStartTurn(this.clock.now())) return;
-    const { turnId } = await this.appServer.startTurn(
+    await this.#startOwnedTurn(
       threadId,
       prompt,
       current.workspace,
-      this.#requiredAccessMode(),
+      (turnId) => this.store.recordContinuationTurnStarted(
+        current.taskId,
+        threadId,
+        turnId,
+        this.clock.now(),
+      ),
     );
-    if (!this.store.recordContinuationTurnStarted(
-      current.taskId,
-      threadId,
-      turnId,
-      this.clock.now(),
-    )) return;
-    this.#reconcileTurnStart(threadId, turnId);
   }
 
   #requiredAccessMode(): AccessMode {
@@ -434,6 +625,34 @@ function nextQuotaCheck(quotaPause: QuotaPause, now: Date): Date {
   return new Date(now.getTime() + backoff);
 }
 
+function isTransientFailure(codexErrorInfo: unknown): boolean {
+  if (
+    codexErrorInfo === "internalServerError"
+    || codexErrorInfo === "rateLimitExceeded"
+    || codexErrorInfo === "serverOverloaded"
+  ) return true;
+  if (!isRecord(codexErrorInfo)) return false;
+  return "httpConnectionFailed" in codexErrorInfo
+    || "responseStreamConnectionFailed" in codexErrorInfo
+    || "responseStreamDisconnected" in codexErrorInfo
+    || "responseTooManyFailedAttempts" in codexErrorInfo;
+}
+
+function unattendedRequestMessage(kind: UnattendedRequest["kind"]): string {
+  switch (kind) {
+    case "command_approval":
+      return "Codex requested command approval; user action is required.";
+    case "file_change_approval":
+      return "Codex requested file-change approval; user action is required.";
+    case "permission_request":
+      return "Codex requested additional permissions; user action is required.";
+    case "user_input":
+      return "Codex requested user input; user action is required.";
+    case "mcp_elicitation":
+      return "An MCP server requested user input; user action is required.";
+  }
+}
+
 async function waitUntil(
   clock: Clock,
   until: Date,
@@ -513,6 +732,22 @@ export async function handleTaskRequest(
         throw new Error("task/cancel requires a Task ID.");
       }
       return taskService.cancel(request.params.taskId);
+    }
+    case "task/retry": {
+      if (
+        !isRecord(request.params)
+        || !isTaskId(request.params.taskId)
+        || typeof request.params.prompt !== "string"
+      ) {
+        throw new Error("task/retry requires a Task ID and a new prompt.");
+      }
+      return taskService.retry(request.params.taskId, request.params.prompt);
+    }
+    case "task/complete": {
+      if (!isRecord(request.params) || !isTaskId(request.params.taskId)) {
+        throw new Error("task/complete requires a Task ID.");
+      }
+      return taskService.complete(request.params.taskId);
     }
     case "thread/import": {
       if (!isRecord(request.params) || typeof request.params.threadId !== "string") {

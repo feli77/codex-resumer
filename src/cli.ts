@@ -15,11 +15,13 @@ import {
   addManagedThreadTask,
   addWorkspaceTask,
   cancelTask,
+  completeTask,
   getDaemonStatus,
   getQueueStatus,
   importManagedThread,
   moveTask,
   pauseQueue,
+  retryTask,
   resumeQueueRun,
   startDaemon,
   startQueueRun,
@@ -34,7 +36,8 @@ import { resolvePaths, type DaemonPaths } from "./paths.js";
 const usage = `Usage:
   codex-resumer daemon <start|stop|status>
   codex-resumer task add (--workspace <path> | --thread <thread-id>) [<prompt>]
-  codex-resumer task <list|cancel <task-id>>
+  codex-resumer task <list|cancel <task-id>|complete <task-id>>
+  codex-resumer task retry <task-id> [<new-prompt>]
   codex-resumer task move <task-id> (--before|--after) <task-id>
   codex-resumer thread import <thread-id>
   codex-resumer queue start (--until-idle | --cutoff <timestamp>) [--yes]
@@ -111,6 +114,21 @@ async function main(args: string[]): Promise<number> {
     const taskId = parseTaskId(args[2]);
     await cancelTask(paths, taskId);
     process.stdout.write(`Task ${taskId} cancelled.\n`);
+    return 0;
+  }
+
+  if (args[0] === "task" && args[1] === "retry" && args[2]) {
+    const taskId = parseTaskId(args[2]);
+    const prompt = args.length > 3 ? args.slice(3).join(" ") : await readStdin();
+    await retryTask(paths, taskId, prompt);
+    process.stdout.write(`Task ${taskId} is ready to retry.\n`);
+    return 0;
+  }
+
+  if (args[0] === "task" && args[1] === "complete" && args.length === 3) {
+    const taskId = parseTaskId(args[2]);
+    await completeTask(paths, taskId);
+    process.stdout.write(`Task ${taskId} completed manually.\n`);
     return 0;
   }
 

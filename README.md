@@ -130,10 +130,34 @@ codex-resumer task move 4 --after 2
 codex-resumer task cancel 3
 ```
 
-Only queued Tasks can be moved or cancelled, and a queued Task cannot be moved
-before the active Task. Cancelling a Task keeps its terminal metadata but
-removes its prompt. `task list` and `queue status` show Queue order, state,
-Workspace, Thread, and Turn identifiers without displaying prompts.
+Only queued Tasks can be moved, and a queued Task cannot be moved before the
+active Task. Cancelling a queued or Needs Attention Task keeps its terminal
+metadata, preserves Workspace edits, and removes its prompt. Cancelling the
+active Task also interrupts its Turn and pauses the whole Queue.
+
+Transient network and service failures retry the same Managed Thread up to
+three times with exponential backoff. Authentication, configuration, model,
+process, permission, and unknown failures do not become Quota Pauses or advance
+the Queue. Approval, permission, MCP elicitation, and user-input requests are
+never approved unattended: Codex Resumer returns a protocol-safe cancellation
+or empty response, marks the Task `needs_attention`, and pauses the Queue.
+
+Resolve a Needs Attention Task explicitly, then resume the Queue separately:
+
+```sh
+codex-resumer task retry 3 "A new prompt based on the current Workspace state"
+codex-resumer task complete 3
+codex-resumer task cancel 3
+codex-resumer queue resume --until-idle
+```
+
+`task retry` is available only for a Needs Attention Task and requires a new
+prompt; the stored old prompt is never reused. `task complete` records manual
+completion. Every manual resolution leaves the Queue paused until an explicit
+resume. External activity on a Managed Thread also pauses the Queue for review
+without interrupting a Turn that Codex Resumer already owns. `task list` and
+`queue status` show Queue order, state, Workspace, Thread, and Turn identifiers
+without displaying prompts.
 
 Workspace paths are stored as canonical absolute paths. A successful Codex Turn
 completes the Task and starts the next queued Task; no marker is required in the

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -479,14 +479,6 @@ test("a queued Task cannot move before the active Task", async (t) => {
       return true;
     },
   );
-  await assert.rejects(
-    runCli("task", "cancel", "1"),
-    (error: unknown) => {
-      assert.ok(error instanceof Error && "stderr" in error);
-      assert.match(String(error.stderr), /Task 1 is not queued/);
-      return true;
-    },
-  );
   assert.match(
     await runCli("task", "list"),
     /Task 1: running[\s\S]*Task 2: queued/,
@@ -562,6 +554,273 @@ test("Queue start, pause, and resume never duplicate the active Turn", async (t)
     .map((line) => JSON.parse(line) as { message?: { method?: string } });
   assert.equal(
     records.filter((record) => record.message?.method === "turn/start").length,
+    1,
+  );
+});
+
+test("a non-quota Turn failure pauses the Queue as Needs Attention", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    turnErrors: [{ codexErrorInfo: "unauthorized", message: "login expired" }],
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "First");
+  await runCli("task", "add", "--workspace", workspace, "Do not start");
+  await runCli("queue", "start", "--until-idle");
+
+  const status = await waitForQueueStatus(runCli, "Task 1: needs_attention");
+  assert.match(status, /Queue is paused\.[\s\S]*Pause reason: Needs Attention/);
+  assert.match(status, /Error turn_failed: login expired/);
+  assert.match(status, /Task 1: needs_attention[\s\S]*Task 2: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
+    1,
+  );
+});
+
+test("task retry requires a new prompt and waits for explicit Queue resume", async (t) => {
+  const { fakeCodex, runCli, runCliWithInput, workspace } =
+    await createCliTestEnvironment(t, {
+      completeTurnSynchronously: true,
+      turnErrors: [{ codexErrorInfo: "badRequest", message: "fix the request" }],
+    });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Old prompt");
+  await runCli("queue", "start", "--until-idle");
+  await waitForQueueStatus(runCli, "Task 1: needs_attention");
+
+  await assert.rejects(
+    runCliWithInput("", "task", "retry", "1"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /new retry prompt must not be empty/i);
+      return true;
+    },
+  );
+  assert.equal(
+    await runCli("task", "retry", "1", "Use", "the", "corrected", "input"),
+    "Task 1 is ready to retry.\n",
+  );
+
+  let status = await runCli("queue", "status");
+  assert.match(status, /Queue is paused\.[\s\S]*Task 1: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
+    1,
+  );
+
+  assert.equal(await runCli("queue", "resume", "--until-idle"), "Queue resumed.\n");
+  status = await waitForQueueStatus(runCli, "Task 1: completed");
+  assert.match(status, /Queue is idle/);
+  assert.deepEqual(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start")
+      .map((message) => {
+        const input = message.params?.input as Array<{ text?: string }> | undefined;
+        return input?.[0]?.text;
+      }),
+    ["Old prompt", "Use the corrected input"],
+  );
+  await assert.rejects(
+    runCli("task", "retry", "1", "Try again"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /does not need attention/i);
+      return true;
+    },
+  );
+});
+
+test("task complete resolves Needs Attention without resuming the Queue", async (t) => {
+  const { fakeCodex, runCli, stateDir, workspace } =
+    await createCliTestEnvironment(t, {
+      turnErrors: [{ codexErrorInfo: "other", message: "inspect manually" }],
+    });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Sensitive prompt");
+  await runCli("task", "add", "--workspace", workspace, "Later work");
+  await runCli("queue", "start", "--until-idle");
+  await waitForQueueStatus(runCli, "Task 1: needs_attention");
+
+  assert.equal(await runCli("task", "complete", "1"), "Task 1 completed manually.\n");
+  const status = await runCli("queue", "status");
+  assert.match(status, /Queue is paused\.[\s\S]*Task 1: completed[\s\S]*Task 2: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
+    1,
+  );
+
+  const database = new Database(
+    path.join(stateDir, "codex-resumer", "state.sqlite3"),
+    { readonly: true },
+  );
+  t.after(() => database.close());
+  assert.deepEqual(
+    database.prepare("SELECT state, prompt FROM tasks WHERE id = 1").get(),
+    { state: "completed", prompt: null },
+  );
+});
+
+test("cancelling an active Task interrupts its Turn and pauses the Queue", async (t) => {
+  const { fakeCodex, runCli, stateDir, workspace } =
+    await createCliTestEnvironment(t, { completeTurn: false });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Active secret");
+  await runCli("task", "add", "--workspace", workspace, "Later secret");
+  await runCli("queue", "start", "--until-idle");
+
+  assert.equal(await runCli("task", "cancel", "1"), "Task 1 cancelled.\n");
+  const status = await runCli("queue", "status");
+  assert.match(status, /Queue is paused\.[\s\S]*Task 1: cancelled[\s\S]*Task 2: queued/);
+  assert.doesNotMatch(status, /Active secret|Later secret/);
+
+  const messages = await readFakeMessages(fakeCodex.logPath);
+  assert.deepEqual(
+    messages
+      .filter((message) => message.method === "turn/interrupt")
+      .map((message) => message.params),
+    [{ threadId: "thread-fake", turnId: "turn-fake" }],
+  );
+  assert.equal(
+    messages.filter((message) => message.method === "turn/start").length,
+    1,
+  );
+
+  const database = new Database(
+    path.join(stateDir, "codex-resumer", "state.sqlite3"),
+    { readonly: true },
+  );
+  t.after(() => database.close());
+  assert.deepEqual(
+    database.prepare("SELECT state, prompt FROM tasks WHERE id = 1").get(),
+    { state: "cancelled", prompt: null },
+  );
+});
+
+test("task cancel resolves Needs Attention and leaves Workspace changes intact", async (t) => {
+  const { runCli, stateDir, workspace } = await createCliTestEnvironment(t, {
+    turnErrors: [{ codexErrorInfo: "other", message: "review partial work" }],
+  });
+  const partialWork = path.join(workspace, "partial.txt");
+  await writeFile(partialWork, "keep this\n");
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Sensitive prompt");
+  await runCli("queue", "start", "--until-idle");
+  await waitForQueueStatus(runCli, "Task 1: needs_attention");
+
+  assert.equal(await runCli("task", "cancel", "1"), "Task 1 cancelled.\n");
+  assert.match(await runCli("queue", "status"), /Queue is paused\.[\s\S]*Task 1: cancelled/);
+  assert.equal(await readFile(partialWork, "utf8"), "keep this\n");
+
+  const database = new Database(
+    path.join(stateDir, "codex-resumer", "state.sqlite3"),
+    { readonly: true },
+  );
+  t.after(() => database.close());
+  assert.deepEqual(
+    database.prepare("SELECT state, prompt FROM tasks WHERE id = 1").get(),
+    { state: "cancelled", prompt: null },
+  );
+});
+
+test("an unattended user-input request becomes Needs Attention", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurn: false,
+    unattendedRequestMethods: ["item/tool/requestUserInput"],
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Ask if blocked");
+  await runCli("task", "add", "--workspace", workspace, "Do not start");
+  await runCli("queue", "start", "--until-idle");
+
+  const status = await waitForQueueStatus(runCli, "Task 1: needs_attention");
+  assert.match(status, /Queue is paused\.[\s\S]*Pause reason: Needs Attention/);
+  assert.match(status, /Error unattended_request: Codex requested user input/);
+  assert.match(status, /Task 1: needs_attention[\s\S]*Task 2: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
+    1,
+  );
+});
+
+test("an App Server process failure becomes Needs Attention", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurn: false,
+    exitAfterTurnStart: true,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Active work");
+  await runCli("task", "add", "--workspace", workspace, "Do not start");
+  await runCli("queue", "start", "--until-idle");
+
+  const status = await waitForQueueStatus(runCli, "Task 1: needs_attention");
+  assert.match(status, /Queue is paused\.[\s\S]*Pause reason: Needs Attention/);
+  assert.match(status, /Error app_server_process_exit:/);
+  assert.match(status, /Task 1: needs_attention[\s\S]*Task 2: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
+    1,
+  );
+});
+
+test("external Managed Thread activity pauses without interrupting the owned Turn", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurn: false,
+    externalTurnStarted: true,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Owned work");
+  await runCli("task", "add", "--workspace", workspace, "Do not start");
+  await runCli("queue", "start", "--until-idle");
+
+  const status = await waitForQueueStatus(runCli, "Error external_thread_activity:");
+  assert.match(status, /Queue is paused\.[\s\S]*Pause reason: Needs Attention/);
+  assert.match(status, /Task 1: running[\s\S]*Task 2: queued/);
+  const messages = await readFakeMessages(fakeCodex.logPath);
+  assert.equal(
+    messages.filter((message) => message.method === "turn/interrupt").length,
+    0,
+  );
+  assert.equal(
+    messages.filter((message) => message.method === "turn/start").length,
+    1,
+  );
+});
+
+test("Queue resume cannot skip an unresolved Needs Attention Task", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    turnErrors: [{ codexErrorInfo: "badRequest", message: "needs correction" }],
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "First");
+  await runCli("task", "add", "--workspace", workspace, "Second");
+  await runCli("queue", "start", "--until-idle");
+  await waitForQueueStatus(runCli, "Task 1: needs_attention");
+
+  await assert.rejects(
+    runCli("queue", "resume", "--until-idle"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /resolve Task 1 before resuming the Queue/i);
+      return true;
+    },
+  );
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
     1,
   );
 });

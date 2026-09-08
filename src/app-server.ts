@@ -11,6 +11,9 @@ import type {
   AppServerProbeResult,
   CompletedTurn,
   RateLimitSnapshot,
+  StartedTurn,
+  UnattendedRequest,
+  UnattendedRequestKind,
   UsageLimitExceeded,
 } from "./daemon.js";
 import type { AccessMode } from "./config.js";
@@ -104,7 +107,17 @@ const schemaFileContracts: readonly SchemaFileContract[] = [
     objects: [{
       properties: ["error", "threadId", "turnId", "willRetry"],
       required: ["error", "threadId", "turnId", "willRetry"],
-      literals: ["usageLimitExceeded", "unauthorized"],
+      literals: [
+        "httpConnectionFailed",
+        "internalServerError",
+        "rateLimitExceeded",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+        "serverOverloaded",
+        "unauthorized",
+        "usageLimitExceeded",
+      ],
     }],
   },
   {
@@ -241,6 +254,11 @@ export class CodexAppServer implements AppServerController {
   #nextRequestId = 0;
   #pending = new Map<number, PendingRequest>();
   #turnCompletedListeners = new Set<(turn: CompletedTurn) => void>();
+  #turnStartedListeners = new Set<(turn: StartedTurn) => void>();
+  #unattendedRequestListeners = new Set<
+    (request: UnattendedRequest) => void
+  >();
+  #unexpectedExitListeners = new Set<(error: Error) => void>();
   #usageLimitListeners = new Set<(event: UsageLimitExceeded) => void>();
   #closePromise: Promise<void> | undefined;
 
@@ -395,6 +413,10 @@ export class CodexAppServer implements AppServerController {
     return { turnId: result.turn.id };
   }
 
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    await this.#request("turn/interrupt", { threadId, turnId });
+  }
+
   async #readConfiguredAccess(workspace: string): Promise<TurnAccess> {
     const result = await this.#request("config/read", {
       cwd: workspace,
@@ -415,6 +437,23 @@ export class CodexAppServer implements AppServerController {
   onTurnCompleted(listener: (turn: CompletedTurn) => void): () => void {
     this.#turnCompletedListeners.add(listener);
     return () => this.#turnCompletedListeners.delete(listener);
+  }
+
+  onTurnStarted(listener: (turn: StartedTurn) => void): () => void {
+    this.#turnStartedListeners.add(listener);
+    return () => this.#turnStartedListeners.delete(listener);
+  }
+
+  onUnattendedRequest(
+    listener: (request: UnattendedRequest) => void,
+  ): () => void {
+    this.#unattendedRequestListeners.add(listener);
+    return () => this.#unattendedRequestListeners.delete(listener);
+  }
+
+  onUnexpectedExit(listener: (error: Error) => void): () => void {
+    this.#unexpectedExitListeners.add(listener);
+    return () => this.#unexpectedExitListeners.delete(listener);
   }
 
   onUsageLimitExceeded(listener: (event: UsageLimitExceeded) => void): () => void {
@@ -479,8 +518,14 @@ export class CodexAppServer implements AppServerController {
     child.stderr.resume();
     this.#lineReader = readline.createInterface({ input: child.stdout });
     this.#lineReader.on("line", (line) => this.#handleLine(line));
-    child.once("exit", () => {
-      this.#rejectPending(new Error("Codex App Server exited during startup"));
+    child.once("exit", (code, signal) => {
+      const error = new Error(
+        `Codex App Server exited unexpectedly (${signal ?? `code ${code ?? "unknown"}`}).`,
+      );
+      this.#rejectPending(error);
+      if (!this.#closePromise) {
+        for (const listener of this.#unexpectedExitListeners) listener(error);
+      }
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -525,6 +570,14 @@ export class CodexAppServer implements AppServerController {
       return;
     }
     if (!isRecord(message)) return;
+    const unattendedRequest = parseUnattendedRequest(message);
+    if (unattendedRequest && typeof message.id === "number") {
+      this.#respond(message.id, safeUnattendedResponse(unattendedRequest.kind));
+      for (const listener of this.#unattendedRequestListeners) {
+        listener(unattendedRequest);
+      }
+      return;
+    }
     if (message.method === "error") {
       const usageLimit = parseUsageLimitExceeded(message.params);
       if (usageLimit) {
@@ -536,6 +589,13 @@ export class CodexAppServer implements AppServerController {
       const completed = parseCompletedTurn(message.params);
       if (completed) {
         for (const listener of this.#turnCompletedListeners) listener(completed);
+      }
+      return;
+    }
+    if (message.method === "turn/started") {
+      const started = parseStartedTurn(message.params);
+      if (started) {
+        for (const listener of this.#turnStartedListeners) listener(started);
       }
       return;
     }
@@ -567,6 +627,10 @@ export class CodexAppServer implements AppServerController {
       pending.reject(error);
     }
     this.#pending.clear();
+  }
+
+  #respond(id: number, result: unknown): void {
+    this.#child?.stdin.write(`${JSON.stringify({ id, result })}\n`);
   }
 }
 
@@ -761,7 +825,63 @@ function parseCompletedTurn(value: unknown): CompletedTurn | undefined {
   if (status !== "completed" && status !== "failed" && status !== "interrupted") {
     return undefined;
   }
-  return { threadId: value.threadId, turnId: id, status };
+  const error = parseTurnError(value.turn.error);
+  return {
+    threadId: value.threadId,
+    turnId: id,
+    status,
+    ...(error ? { error } : {}),
+  };
+}
+
+function parseStartedTurn(value: unknown): StartedTurn | undefined {
+  if (
+    !isRecord(value)
+    || typeof value.threadId !== "string"
+    || !isRecord(value.turn)
+    || typeof value.turn.id !== "string"
+  ) return undefined;
+  return { threadId: value.threadId, turnId: value.turn.id };
+}
+
+function parseTurnError(value: unknown): CompletedTurn["error"] {
+  if (!isRecord(value) || typeof value.message !== "string") return undefined;
+  return {
+    message: value.message,
+    ...(value.codexErrorInfo === null || value.codexErrorInfo === undefined
+      ? {}
+      : { codexErrorInfo: value.codexErrorInfo }),
+  };
+}
+
+function parseUnattendedRequest(value: Record<string, unknown>):
+  UnattendedRequest | undefined {
+  if (!isRecord(value.params)) return undefined;
+  const { threadId, turnId } = value.params;
+  if (typeof threadId !== "string" || typeof turnId !== "string") return undefined;
+  const kinds: Record<string, UnattendedRequestKind> = {
+    "item/commandExecution/requestApproval": "command_approval",
+    "item/fileChange/requestApproval": "file_change_approval",
+    "item/permissions/requestApproval": "permission_request",
+    "item/tool/requestUserInput": "user_input",
+    "mcpServer/elicitation/request": "mcp_elicitation",
+  };
+  const kind = typeof value.method === "string" ? kinds[value.method] : undefined;
+  return kind ? { kind, threadId, turnId } : undefined;
+}
+
+function safeUnattendedResponse(kind: UnattendedRequestKind): unknown {
+  switch (kind) {
+    case "command_approval":
+    case "file_change_approval":
+      return { decision: "cancel" };
+    case "permission_request":
+      return { permissions: {} };
+    case "user_input":
+      return { answers: {} };
+    case "mcp_elicitation":
+      return { action: "cancel" };
+  }
 }
 
 function incompatible(

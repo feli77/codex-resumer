@@ -14,11 +14,14 @@ interface FakeCodexOptions {
   } | null;
   completeTurn?: boolean;
   completeTurnSynchronously?: boolean;
+  exitAfterTurnStart?: boolean;
+  externalTurnStarted?: boolean;
   omitClientRequest?: string;
   omitRateLimitResetTime?: boolean;
   turnStartRpcError?: { code: number; data?: unknown; message: string };
   turnCompletionDelayMs?: number;
   turnErrors?: Array<{ codexErrorInfo: string; message: string }>;
+  unattendedRequestMethods?: string[];
 }
 
 export async function createFakeCodex(
@@ -122,7 +125,17 @@ if (args[0] === "app-server" && args[1] === "generate-json-schema") {
     "v2/ErrorNotification.json": {
       properties: properties("error", "threadId", "turnId", "willRetry"),
       required: ["error", "threadId", "turnId", "willRetry"],
-      definitions: { CodexErrorInfo: { enum: ["usageLimitExceeded", "unauthorized"] } },
+      definitions: { CodexErrorInfo: { enum: [
+        "httpConnectionFailed",
+        "internalServerError",
+        "rateLimitExceeded",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+        "serverOverloaded",
+        "unauthorized",
+        "usageLimitExceeded",
+      ] } },
     },
     "v2/ThreadStartParams.json": {
       properties: properties("cwd", "approvalPolicy", "sandbox"),
@@ -276,6 +289,7 @@ const threads = new Map();
 let startedThreadCount = 0;
 let turnCount = 0;
 const turnErrors = ${JSON.stringify(options.turnErrors ?? [])};
+const unattendedRequestMethods = ${JSON.stringify(options.unattendedRequestMethods ?? [])};
 lines.on("line", (line) => {
   const message = JSON.parse(line);
   log({ type: "message", message });
@@ -385,6 +399,29 @@ lines.on("line", (line) => {
         turn: { ...turn, status: "failed", error: turnError },
       } });
       process.stdout.write(response + "\\n" + error + "\\n" + failed + "\\n");
+    } else if (${String(options.externalTurnStarted === true)}) {
+      const external = JSON.stringify({ method: "turn/started", params: {
+        threadId: message.params.threadId,
+        turn: { id: "turn-external", status: "inProgress", items: [] },
+      } });
+      process.stdout.write(response + "\\n" + external + "\\n");
+    } else if (${String(options.exitAfterTurnStart === true)}) {
+      console.log(response);
+      setImmediate(() => process.exit(17));
+    } else if (unattendedRequestMethods.length > 0) {
+      const requests = unattendedRequestMethods.map((method, index) => JSON.stringify({
+        id: 1000 + index,
+        method,
+        params: {
+          itemId: "item-" + index,
+          questions: [],
+          permissions: {},
+          serverName: "fake-mcp",
+          threadId: message.params.threadId,
+          turnId,
+        },
+      }));
+      process.stdout.write([response, ...requests].join("\\n") + "\\n");
     } else if (${String(options.completeTurn !== false)}) {
       const completed = JSON.stringify({ method: "turn/completed", params: {
         threadId: message.params.threadId,
@@ -400,6 +437,8 @@ lines.on("line", (line) => {
         );
       }
     } else console.log(response);
+  } else if (message.method === "turn/interrupt") {
+    console.log(JSON.stringify({ id: message.id, result: {} }));
   }
 });
 `;

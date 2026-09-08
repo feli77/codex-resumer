@@ -19,6 +19,7 @@ import {
   startQueueRun,
   type AppServerController,
   type CompletedTurn,
+  type UnattendedRequest,
 } from "../src/daemon.js";
 import { resolvePaths } from "../src/paths.js";
 import { createFakeCodex } from "./fake-codex.js";
@@ -93,6 +94,9 @@ class FakeAppServer implements AppServerController {
   #usageLimitListeners = new Set<
     (event: { threadId: string; turnId: string }) => void
   >();
+  #unattendedRequestListeners = new Set<
+    (request: UnattendedRequest) => void
+  >();
 
   async startAndProbe() {
     return { state: "ready", codexVersion: "codex-cli quota-test" } as const;
@@ -132,6 +136,8 @@ class FakeAppServer implements AppServerController {
     return { turnId };
   }
 
+  async interruptTurn(): Promise<void> {}
+
   async readRateLimits(): Promise<RateLimits> {
     const next = this.rateLimitReads.shift();
     if (!next) throw new Error("unexpected rate-limit read");
@@ -144,11 +150,26 @@ class FakeAppServer implements AppServerController {
     return () => this.#completedListeners.delete(listener);
   }
 
+  onTurnStarted(): () => void {
+    return () => undefined;
+  }
+
   onUsageLimitExceeded(
     listener: (event: { threadId: string; turnId: string }) => void,
   ): () => void {
     this.#usageLimitListeners.add(listener);
     return () => this.#usageLimitListeners.delete(listener);
+  }
+
+  onUnattendedRequest(
+    listener: (request: UnattendedRequest) => void,
+  ): () => void {
+    this.#unattendedRequestListeners.add(listener);
+    return () => this.#unattendedRequestListeners.delete(listener);
+  }
+
+  onUnexpectedExit(): () => void {
+    return () => undefined;
   }
 
   emitUsageLimitExceeded(threadId: string, turnId: string): void {
@@ -158,6 +179,22 @@ class FakeAppServer implements AppServerController {
   emitCompleted(threadId: string, turnId: string): void {
     for (const listener of this.#completedListeners) {
       listener({ status: "completed", threadId, turnId });
+    }
+  }
+
+  emitFailed(
+    threadId: string,
+    turnId: string,
+    codexErrorInfo: unknown,
+    message: string,
+  ): void {
+    for (const listener of this.#completedListeners) {
+      listener({
+        error: { codexErrorInfo, message },
+        status: "failed",
+        threadId,
+        turnId,
+      });
     }
   }
 }
@@ -486,6 +523,65 @@ test("only structured UsageLimitExceeded errors emit a Quota Pause signal", asyn
   assert.deepEqual(events, [{ threadId, turnId: "turn-fake-2" }]);
 });
 
+test("unattended App Server requests are safely rejected and never approved", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-unattended-test-"));
+  const methods = [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+  ];
+  const fakeCodex = await createFakeCodex(root, {
+    completeTurn: false,
+    unattendedRequestMethods: methods,
+  });
+  const appServer = new CodexAppServer({
+    command: fakeCodex.command,
+    env: { ...process.env, FAKE_CODEX_LOG: fakeCodex.logPath },
+  });
+  t.after(async () => {
+    await appServer.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  assert.equal((await appServer.startAndProbe()).state, "ready");
+  const requests: string[] = [];
+  appServer.onUnattendedRequest((request) => requests.push(request.kind));
+  const { threadId } = await appServer.startThread(root);
+
+  await appServer.startTurn(threadId, "Need a human", root, "configured");
+  for (let attempt = 0; attempt < 100 && requests.length < methods.length; attempt += 1) {
+    await settle();
+  }
+
+  const responses = (await readFile(fakeCodex.logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as {
+      message?: { id?: number; result?: unknown };
+    })
+    .map((record) => record.message)
+    .filter((message) => (message?.id ?? 0) >= 1000);
+  assert.deepEqual(requests, [
+    "command_approval",
+    "file_change_approval",
+    "permission_request",
+    "user_input",
+    "mcp_elicitation",
+  ]);
+  assert.deepEqual(responses, [
+    { id: 1000, result: { decision: "cancel" } },
+    { id: 1001, result: { decision: "cancel" } },
+    { id: 1002, result: { permissions: {} } },
+    { id: 1003, result: { answers: {} } },
+    { id: 1004, result: { action: "cancel" } },
+  ]);
+  assert.equal(
+    JSON.stringify(responses).includes("accept"),
+    false,
+  );
+});
+
 test("an App Server Access Mode rejection remains structured and is not downgraded", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-access-error-test-"));
   const rejection = {
@@ -597,7 +693,7 @@ test("an automatic Continuation persists a structured Access Mode rejection", as
   );
 
   assert.equal(snapshot.state, "paused");
-  assert.equal(snapshot.tasks[0]?.state, "waiting_for_quota");
+  assert.equal(snapshot.tasks[0]?.state, "needs_attention");
   assert.deepEqual(
     (snapshot as typeof snapshot & {
       error?: { code: string; details?: unknown; message: string };
@@ -611,6 +707,80 @@ test("an automatic Continuation persists a structured Access Mode rejection", as
       },
       message: "requested sandbox policy is not allowed",
     },
+  );
+});
+
+test("transient service failures use at most three exponential retries", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  await addWorkspaceTask(paths, workspace, "Original work");
+  await addWorkspaceTask(paths, workspace, "Do not advance");
+  await startQueueRun(paths, { kind: "until_idle" });
+
+  appServer.emitFailed("thread-quota", "turn-1", "serverOverloaded", "busy");
+  await waitForScheduledWaitCount(clock, 1);
+  clock.advanceTo("2026-09-04T10:00:01.000Z");
+  await waitForTurnCount(appServer, 2);
+
+  appServer.emitFailed("thread-quota", "turn-2", "internalServerError", "again");
+  await waitForScheduledWaitCount(clock, 2);
+  clock.advanceTo("2026-09-04T10:00:03.000Z");
+  await waitForTurnCount(appServer, 3);
+
+  appServer.emitFailed(
+    "thread-quota",
+    "turn-3",
+    { responseStreamDisconnected: { httpStatusCode: 503 } },
+    "disconnected",
+  );
+  await waitForScheduledWaitCount(clock, 3);
+  clock.advanceTo("2026-09-04T10:00:07.000Z");
+  await waitForTurnCount(appServer, 4);
+
+  appServer.emitFailed("thread-quota", "turn-4", "serverOverloaded", "still busy");
+  const snapshot = await waitForSnapshot(
+    paths,
+    (candidate) => candidate.tasks[0]?.state === "needs_attention",
+  );
+
+  assert.deepEqual(clock.scheduledWaits, [
+    "2026-09-04T10:00:01.000Z",
+    "2026-09-04T10:00:03.000Z",
+    "2026-09-04T10:00:07.000Z",
+  ]);
+  assert.deepEqual(
+    appServer.turns.map((turn) => turn.prompt),
+    [
+      "Original work",
+      DEFAULT_CONTINUATION_PROMPT,
+      DEFAULT_CONTINUATION_PROMPT,
+      DEFAULT_CONTINUATION_PROMPT,
+    ],
+  );
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "needs_attention");
+  assert.equal(snapshot.tasks[1]?.state, "queued");
+});
+
+test("pausing during transient backoff leaves the Task explicitly resolvable", async (t) => {
+  const { appServer, clock, paths, workspace } = await createEnvironment(t);
+  await addWorkspaceTask(paths, workspace, "Original work");
+  await startQueueRun(paths, { kind: "until_idle" });
+
+  appServer.emitFailed("thread-quota", "turn-1", "serverOverloaded", "busy");
+  await waitForScheduledWaitCount(clock, 1);
+  await pauseQueue(paths);
+
+  const snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.pauseReason, "manual");
+  assert.equal(snapshot.tasks[0]?.state, "needs_attention");
+
+  clock.advanceTo("2026-09-04T10:00:01.000Z");
+  await settle();
+  assert.equal(appServer.turns.length, 1);
+  await assert.rejects(
+    resumeQueueRun(paths, { kind: "until_idle" }),
+    /Resolve Task 1 before resuming the Queue/,
   );
 });
 
@@ -635,7 +805,7 @@ test("automatic Queue advance persists a structured Access Mode rejection", asyn
 
   assert.equal(snapshot.state, "paused");
   assert.equal(snapshot.tasks[0]?.state, "completed");
-  assert.equal(snapshot.tasks[1]?.state, "queued");
+  assert.equal(snapshot.tasks[1]?.state, "needs_attention");
   assert.deepEqual(
     (snapshot as typeof snapshot & {
       error?: { code: string; details?: unknown; message: string };
@@ -936,6 +1106,16 @@ async function waitForTaskState(
 async function waitForTurnCount(appServer: FakeAppServer, count: number): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (appServer.turns.length === count) return;
+    await settle();
+  }
+}
+
+async function waitForScheduledWaitCount(
+  clock: ManualClock,
+  count: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (clock.scheduledWaits.length === count) return;
     await settle();
   }
 }

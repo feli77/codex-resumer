@@ -17,6 +17,7 @@ export type TaskState =
   | "queued"
   | "running"
   | "waiting_for_quota"
+  | "needs_attention"
   | "completed"
   | "cancelled";
 
@@ -50,6 +51,18 @@ export interface QuotaPause extends QuotaPauseDetails {
   threadId: string;
   turnId: string;
   workspace: string;
+}
+
+export interface TransientRetry {
+  attempt: number;
+  taskId: number;
+  threadId: string;
+  workspace: string;
+}
+
+export interface TaskCancellation {
+  interrupt?: { threadId: string; turnId: string };
+  taskId: number;
 }
 
 export interface QueueSnapshot {
@@ -104,7 +117,10 @@ function createTasksTable(ifMissing = false): string {
       workspace TEXT NOT NULL,
       prompt TEXT,
       state TEXT NOT NULL CHECK (
-        state IN ('queued', 'running', 'waiting_for_quota', 'completed', 'cancelled')
+        state IN (
+          'queued', 'running', 'waiting_for_quota', 'needs_attention',
+          'completed', 'cancelled'
+        )
       ),
       managed_thread_id TEXT,
       active_turn_id TEXT,
@@ -112,6 +128,7 @@ function createTasksTable(ifMissing = false): string {
       quota_limit_type TEXT,
       quota_reset_at TEXT,
       quota_poll_attempt INTEGER NOT NULL DEFAULT 0,
+      transient_retry_count INTEGER NOT NULL DEFAULT 0,
       queue_position INTEGER NOT NULL,
       created_at TEXT NOT NULL,
       started_at TEXT,
@@ -127,7 +144,9 @@ function createTurnsTable(ifMissing = false): string {
       id TEXT PRIMARY KEY,
       task_id INTEGER NOT NULL REFERENCES tasks(id),
       managed_thread_id TEXT NOT NULL REFERENCES managed_threads(id),
-      state TEXT NOT NULL CHECK (state IN ('in_progress', 'quota_paused', 'completed')),
+      state TEXT NOT NULL CHECK (
+        state IN ('in_progress', 'quota_paused', 'completed', 'failed', 'interrupted')
+      ),
       started_at TEXT NOT NULL,
       completed_at TEXT
     );
@@ -187,6 +206,7 @@ export class StateStore {
     `);
     this.#migrateTaskQueue();
     this.#migrateQuotaPause();
+    this.#migrateNeedsAttention();
     this.#migrateQueuePauseReason();
     this.#migrateQueueError();
     this.#migrateQueueRunAccessMode();
@@ -204,6 +224,15 @@ export class StateStore {
     return this.#database.transaction(() => {
       if (this.#queueRunState(now).kind === "running") {
         return "already-running" as const;
+      }
+      const unresolved = this.#database.prepare(`
+        SELECT id FROM tasks
+        WHERE state = 'needs_attention' ORDER BY queue_position, id LIMIT 1
+      `).get() as { id: number } | undefined;
+      if (unresolved) {
+        throw new Error(
+          `Resolve Task ${unresolved.id} before resuming the Queue.`,
+        );
       }
       if (
         runPolicy.kind === "cutoff_time"
@@ -332,7 +361,13 @@ export class StateStore {
   ): void {
     this.#database.transaction(() => {
       this.#database.prepare(`
-        UPDATE tasks SET state = 'queued', started_at = NULL
+        UPDATE managed_threads SET state = 'idle'
+        WHERE id = (
+          SELECT managed_thread_id FROM tasks WHERE id = ? AND state = 'running'
+        )
+      `).run(taskId);
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'needs_attention'
         WHERE id = ? AND state = 'running'
       `).run(taskId);
       this.#pauseQueue("needs_attention", now, error);
@@ -403,17 +438,83 @@ export class StateStore {
     })();
   }
 
-  cancelQueuedTask(taskId: number, now: Date): void {
+  cancelTask(taskId: number, now: Date): TaskCancellation {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT state, managed_thread_id, active_turn_id
+        FROM tasks WHERE id = ?
+      `).get(taskId) as {
+        active_turn_id: string | null;
+        managed_thread_id: string | null;
+        state: TaskState;
+      } | undefined;
+      if (!task) throw new Error(`Task does not exist: ${taskId}`);
+      if (
+        task.state !== "queued"
+        && task.state !== "running"
+        && task.state !== "waiting_for_quota"
+        && task.state !== "needs_attention"
+      ) {
+        throw new Error(`Task ${taskId} cannot be cancelled from ${task.state}.`);
+      }
+
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'cancelled', prompt = NULL, cancelled_at = ?
+        WHERE id = ?
+      `).run(now.toISOString(), taskId);
+      if (task.managed_thread_id !== null) {
+        this.#database.prepare(`
+          UPDATE managed_threads SET state = 'idle' WHERE id = ?
+        `).run(task.managed_thread_id);
+      }
+      if (task.state === "running" || task.state === "waiting_for_quota") {
+        this.#pauseQueue("manual", now);
+      }
+      return {
+        taskId,
+        ...(task.state === "running"
+          && task.managed_thread_id !== null
+          && task.active_turn_id !== null
+          ? {
+            interrupt: {
+              threadId: task.managed_thread_id,
+              turnId: task.active_turn_id,
+            },
+          }
+          : {}),
+      };
+    })();
+  }
+
+  retryNeedsAttentionTask(taskId: number, prompt: string): void {
     const result = this.#database.prepare(`
       UPDATE tasks
-      SET state = 'cancelled', prompt = NULL, cancelled_at = ?
-      WHERE id = ? AND state = 'queued'
-    `).run(now.toISOString(), taskId);
+      SET state = 'queued', prompt = ?, active_turn_id = NULL,
+          quota_limit_id = NULL, quota_limit_type = NULL, quota_reset_at = NULL,
+          quota_poll_attempt = 0, transient_retry_count = 0, started_at = NULL
+      WHERE id = ? AND state = 'needs_attention'
+    `).run(prompt, taskId);
     if (result.changes === 1) return;
     const task = this.#database.prepare("SELECT state FROM tasks WHERE id = ?")
       .get(taskId) as { state: TaskState } | undefined;
     if (!task) throw new Error(`Task does not exist: ${taskId}`);
-    throw new Error(`Task ${taskId} is not queued.`);
+    throw new Error(`Task ${taskId} does not need attention.`);
+  }
+
+  completeNeedsAttentionTask(taskId: number, now: Date): void {
+    const completedAt = now.toISOString();
+    const result = this.#database.prepare(`
+      UPDATE tasks
+      SET state = 'completed', prompt = NULL, completed_at = ?,
+          quota_limit_id = NULL, quota_limit_type = NULL, quota_reset_at = NULL,
+          quota_poll_attempt = 0
+      WHERE id = ? AND state = 'needs_attention'
+    `).run(completedAt, taskId);
+    if (result.changes === 1) return;
+    const task = this.#database.prepare("SELECT state FROM tasks WHERE id = ?")
+      .get(taskId) as { state: TaskState } | undefined;
+    if (!task) throw new Error(`Task does not exist: ${taskId}`);
+    throw new Error(`Task ${taskId} does not need attention.`);
   }
 
   recordTurnStarted(
@@ -439,6 +540,25 @@ export class StateStore {
       FROM tasks
       WHERE managed_thread_id = ? AND active_turn_id = ? AND state = 'running'
     `).get(managedThreadId, turnId) !== undefined;
+  }
+
+  hasTurn(managedThreadId: string, turnId: string): boolean {
+    return this.#database.prepare(`
+      SELECT 1 FROM turns WHERE managed_thread_id = ? AND id = ?
+    `).get(managedThreadId, turnId) !== undefined;
+  }
+
+  recordInactiveTurnCompletion(
+    managedThreadId: string,
+    turnId: string,
+    status: "completed" | "failed" | "interrupted",
+    now: Date,
+  ): void {
+    this.#database.prepare(`
+      UPDATE turns SET state = ?, completed_at = ?
+      WHERE managed_thread_id = ? AND id = ?
+        AND state IN ('in_progress', 'quota_paused')
+    `).run(status, now.toISOString(), managedThreadId, turnId);
   }
 
   recordQuotaPause(
@@ -551,6 +671,7 @@ export class StateStore {
         || activeRun.cutoff_time !== cutoffTime
         || new Date(cutoffTime).getTime() > now.getTime()
       ) return false;
+      this.#markDeferredRetryNeedsAttention();
       this.#pauseQueue("cutoff_reached", now);
       return true;
     })();
@@ -562,6 +683,7 @@ export class StateStore {
         "SELECT state FROM queue WHERE id = 1",
       ).get() as { state: "paused" | "running" };
       if (queue.state === "paused") return;
+      this.#markDeferredRetryNeedsAttention();
       this.#pauseQueue("manual", now);
     })();
   }
@@ -629,7 +751,182 @@ export class StateStore {
       this.#database.prepare(`
         UPDATE managed_threads SET state = 'idle' WHERE id = ?
       `).run(task.managed_thread_id);
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'needs_attention'
+        WHERE id = ? AND state = 'waiting_for_quota'
+      `).run(taskId);
       this.#pauseQueue("needs_attention", now, error);
+      return true;
+    })();
+  }
+
+  recordTurnNeedsAttention(
+    managedThreadId: string,
+    turnId: string,
+    turnState: "failed" | "interrupted",
+    error: StructuredError,
+    now: Date,
+  ): boolean {
+    return this.#database.transaction(() => {
+      const turn = this.#database.prepare(`
+        SELECT task_id FROM turns
+        WHERE id = ? AND managed_thread_id = ? AND state = 'in_progress'
+      `).get(turnId, managedThreadId) as { task_id: number } | undefined;
+      if (!turn) return false;
+
+      const completedAt = now.toISOString();
+      this.#database.prepare(`
+        UPDATE turns SET state = ?, completed_at = ? WHERE id = ?
+      `).run(turnState, completedAt, turnId);
+      this.#database.prepare(`
+        UPDATE managed_threads SET state = 'idle' WHERE id = ?
+      `).run(managedThreadId);
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'needs_attention'
+        WHERE id = ? AND state = 'running'
+      `).run(turn.task_id);
+      this.#pauseQueue("needs_attention", now, error);
+      return true;
+    })();
+  }
+
+  recordUnattendedRequest(
+    managedThreadId: string,
+    turnId: string,
+    error: StructuredError,
+    now: Date,
+  ): boolean {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT id FROM tasks
+        WHERE managed_thread_id = ? AND active_turn_id = ? AND state = 'running'
+      `).get(managedThreadId, turnId) as { id: number } | undefined;
+      if (!task) return false;
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'needs_attention' WHERE id = ?
+      `).run(task.id);
+      this.#pauseQueue("needs_attention", now, error);
+      return true;
+    })();
+  }
+
+  recordTransientFailure(
+    managedThreadId: string,
+    turnId: string,
+    now: Date,
+  ): TransientRetry | "exhausted" | undefined {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT tasks.id, tasks.workspace, tasks.transient_retry_count
+        FROM turns
+        JOIN tasks ON tasks.id = turns.task_id
+        WHERE turns.id = ? AND turns.managed_thread_id = ?
+          AND turns.state = 'in_progress' AND tasks.state = 'running'
+      `).get(turnId, managedThreadId) as {
+        id: number;
+        transient_retry_count: number;
+        workspace: string;
+      } | undefined;
+      if (!task) return undefined;
+      if (task.transient_retry_count >= 3) return "exhausted" as const;
+
+      const completedAt = now.toISOString();
+      const attempt = task.transient_retry_count + 1;
+      this.#database.prepare(`
+        UPDATE turns SET state = 'failed', completed_at = ? WHERE id = ?
+      `).run(completedAt, turnId);
+      this.#database.prepare(`
+        UPDATE managed_threads SET state = 'idle' WHERE id = ?
+      `).run(managedThreadId);
+      this.#database.prepare(`
+        UPDATE tasks SET transient_retry_count = ? WHERE id = ?
+      `).run(attempt, task.id);
+      return {
+        attempt,
+        taskId: task.id,
+        threadId: managedThreadId,
+        workspace: task.workspace,
+      };
+    })();
+  }
+
+  recordTransientRetryStarted(
+    taskId: number,
+    managedThreadId: string,
+    turnId: string,
+    now: Date,
+  ): boolean {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT id FROM tasks
+        WHERE id = ? AND managed_thread_id = ? AND state = 'running'
+      `).get(taskId, managedThreadId);
+      if (!task) return false;
+      this.#database.prepare(`
+        INSERT INTO turns (id, task_id, managed_thread_id, state, started_at)
+        VALUES (?, ?, ?, 'in_progress', ?)
+      `).run(turnId, taskId, managedThreadId, now.toISOString());
+      this.#database.prepare(`
+        UPDATE tasks SET active_turn_id = ? WHERE id = ?
+      `).run(turnId, taskId);
+      return true;
+    })();
+  }
+
+  recordTaskNeedsAttention(
+    taskId: number,
+    error: StructuredError,
+    now: Date,
+  ): boolean {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT managed_thread_id FROM tasks
+        WHERE id = ? AND state IN ('queued', 'running', 'waiting_for_quota')
+      `).get(taskId) as { managed_thread_id: string | null } | undefined;
+      if (!task) return false;
+      if (task.managed_thread_id !== null) {
+        this.#database.prepare(`
+          UPDATE managed_threads SET state = 'idle' WHERE id = ?
+        `).run(task.managed_thread_id);
+      }
+      this.#database.prepare(`
+        UPDATE tasks SET state = 'needs_attention' WHERE id = ?
+      `).run(taskId);
+      this.#pauseQueue("needs_attention", now, error);
+      return true;
+    })();
+  }
+
+  recordActiveTaskNeedsAttention(
+    error: StructuredError,
+    now: Date,
+  ): boolean {
+    const task = this.#database.prepare(`
+      SELECT id FROM tasks
+      WHERE state IN ('running', 'waiting_for_quota') LIMIT 1
+    `).get() as { id: number } | undefined;
+    return task ? this.recordTaskNeedsAttention(task.id, error, now) : false;
+  }
+
+  recordExternalThreadActivity(
+    managedThreadId: string,
+    turnId: string,
+    now: Date,
+  ): boolean {
+    return this.#database.transaction(() => {
+      const managedThread = this.#database.prepare(`
+        SELECT 1 FROM managed_threads WHERE id = ?
+      `).get(managedThreadId);
+      if (!managedThread) return false;
+      this.#pauseQueue(
+        "needs_attention",
+        now,
+        {
+          code: "external_thread_activity",
+          details: { threadId: managedThreadId, turnId },
+          message: "External activity was detected on a Managed Thread.",
+        },
+      );
       return true;
     })();
   }
@@ -682,7 +979,8 @@ export class StateStore {
       (task) =>
         task.state === "queued"
         || task.state === "running"
-        || task.state === "waiting_for_quota",
+        || task.state === "waiting_for_quota"
+        || task.state === "needs_attention",
     );
     return {
       state: queue.state === "running"
@@ -820,6 +1118,50 @@ export class StateStore {
     if (violations.length > 0) throw new Error("Quota Pause migration failed.");
   }
 
+  #migrateNeedsAttention(): void {
+    const columns = this.#database.pragma("table_info(tasks)") as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "transient_retry_count")) return;
+
+    this.#database.pragma("foreign_keys = OFF");
+    try {
+      this.#database.transaction(() => {
+        this.#database.exec(`
+          DROP INDEX IF EXISTS one_active_task;
+          ALTER TABLE turns RENAME TO turns_before_needs_attention;
+          ALTER TABLE tasks RENAME TO tasks_before_needs_attention;
+
+          ${createTasksTable()}
+          INSERT INTO tasks (
+            id, workspace, prompt, state, managed_thread_id, active_turn_id,
+            quota_limit_id, quota_limit_type, quota_reset_at, quota_poll_attempt,
+            transient_retry_count, queue_position, created_at, started_at,
+            completed_at, cancelled_at
+          )
+          SELECT
+            id, workspace, prompt, state, managed_thread_id, active_turn_id,
+            quota_limit_id, quota_limit_type, quota_reset_at, quota_poll_attempt,
+            0, queue_position, created_at, started_at, completed_at, cancelled_at
+          FROM tasks_before_needs_attention;
+
+          ${createTurnsTable()}
+          INSERT INTO turns (
+            id, task_id, managed_thread_id, state, started_at, completed_at
+          )
+          SELECT id, task_id, managed_thread_id, state, started_at, completed_at
+          FROM turns_before_needs_attention;
+
+          DROP TABLE turns_before_needs_attention;
+          DROP TABLE tasks_before_needs_attention;
+          ${createActiveTaskIndex()}
+        `);
+      })();
+    } finally {
+      this.#database.pragma("foreign_keys = ON");
+    }
+    const violations = this.#database.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) throw new Error("Needs Attention migration failed.");
+  }
+
   #migrateQueuePauseReason(): void {
     const columns = this.#database.pragma("table_info(queue)") as Array<{ name: string }>;
     if (columns.some((column) => column.name === "pause_reason")) return;
@@ -863,6 +1205,15 @@ export class StateStore {
       ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'configured'
         CHECK (access_mode IN ('configured', 'full'));
     `);
+  }
+
+  #markDeferredRetryNeedsAttention(): void {
+    this.#database.prepare(`
+      UPDATE tasks
+      SET state = 'needs_attention'
+      WHERE state = 'running'
+        AND active_turn_id IN (SELECT id FROM turns WHERE state = 'failed')
+    `).run();
   }
 
   #queueRunState(now: Date): PersistedQueueRunState {
