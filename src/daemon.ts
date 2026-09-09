@@ -458,10 +458,11 @@ export async function stopDaemon(
 ): Promise<"stopped" | "already-stopped"> {
   let response: { result?: unknown; error?: unknown };
   try {
-    response = await sendRequest(paths.socketPath, {
-      method: "stop",
-      params: { force },
-    });
+    response = await sendRequest(
+      paths.socketPath,
+      { method: "stop", params: { force } },
+      10_000,
+    );
   } catch {
     return "already-stopped";
   }
@@ -481,11 +482,11 @@ export async function stopDaemon(
     return "already-stopped";
   }
 
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 250; attempt += 1) {
     if (!(await requestRunningStatus(paths))) return "stopped";
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error("daemon did not stop within 500ms");
+  throw new Error("daemon did not stop within 5 seconds");
 }
 
 async function preparePrivateDirectories(paths: DaemonPaths): Promise<void> {
@@ -674,6 +675,7 @@ async function requestRunningStatus(
 function sendRequest(
   socketPath: string,
   request: { method: string; params?: unknown },
+  timeoutMs = 500,
 ): Promise<{ result?: unknown; error?: unknown }> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
@@ -681,7 +683,7 @@ function sendRequest(
     const timeout = setTimeout(() => {
       socket.destroy();
       reject(new Error("daemon request timed out"));
-    }, 500);
+    }, timeoutMs);
 
     const finish = (callback: () => void): void => {
       clearTimeout(timeout);

@@ -39,6 +39,7 @@ export class TaskService {
   #transientRetry: Promise<void> = Promise.resolve();
   #unattendedBeforeTurnStart: UnattendedRequest | undefined;
   #turnStartsInProgress = new Set<string>();
+  #turnStartOperations = new Set<Promise<void>>();
   #startedBeforeTurnRecorded: StartedTurn[] = [];
   readonly #stopping = new AbortController();
 
@@ -91,9 +92,10 @@ export class TaskService {
 
   async restoreQueueRun(): Promise<void> {
     const queueRun = this.store.restoreQueueRun(this.clock.now());
-    if (!queueRun) return;
-    this.#accessMode = queueRun.accessMode;
-    this.#scheduleCutoff(queueRun.runPolicy);
+    if (queueRun) {
+      this.#accessMode = queueRun.accessMode;
+      this.#scheduleCutoff(queueRun.runPolicy);
+    }
     const recoveryTask = this.store.readRecoveryTask();
     if (
       recoveryTask
@@ -197,7 +199,7 @@ export class TaskService {
         && turn.error?.codexErrorInfo === "usageLimitExceeded"
       ) {
         const quotaPause = this.store.readWaitingQuotaPause();
-        if (quotaPause) this.#scheduleQuotaRecovery(quotaPause);
+        if (queueRun && quotaPause) this.#scheduleQuotaRecovery(quotaPause);
         return;
       }
       this.store.recordTaskNeedsAttention(
@@ -214,6 +216,7 @@ export class TaskService {
       );
       return;
     }
+    if (!queueRun) return;
     const quotaPause = this.store.readWaitingQuotaPause();
     if (quotaPause) {
       this.#scheduleQuotaRecovery(quotaPause);
@@ -254,13 +257,14 @@ export class TaskService {
   }
 
   async prepareStop(force: boolean): Promise<{ state: "stopping" }> {
+    this.pause();
+    await Promise.all(this.#turnStartOperations);
     const activeTask = this.store.readRecoveryTask();
     if (activeTask?.state === "running" && !force) {
       throw new Error(
         "An active Turn is still running. Let it finish or use `daemon stop --force` to interrupt it.",
       );
     }
-    this.pause();
     if (activeTask?.state === "running" && force) {
       let interruptError;
       if (activeTask.managedThreadId && activeTask.activeTurnId) {
@@ -435,6 +439,26 @@ export class TaskService {
   }
 
   async #startOwnedTurn(
+    threadId: string,
+    prompt: string,
+    workspace: string,
+    recordStarted: (turnId: string) => boolean,
+  ): Promise<void> {
+    const operation = this.#performOwnedTurnStart(
+      threadId,
+      prompt,
+      workspace,
+      recordStarted,
+    );
+    this.#turnStartOperations.add(operation);
+    try {
+      await operation;
+    } finally {
+      this.#turnStartOperations.delete(operation);
+    }
+  }
+
+  async #performOwnedTurnStart(
     threadId: string,
     prompt: string,
     workspace: string,
