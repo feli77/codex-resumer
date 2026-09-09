@@ -40,7 +40,7 @@ export class TaskService {
   #unattendedBeforeTurnStart: UnattendedRequest | undefined;
   #turnStartsInProgress = new Set<string>();
   #turnStartOperations = new Set<Promise<unknown>>();
-  #unrecordedAcceptedTurns: Array<{ threadId: string; turnId: string }> = [];
+  #unrecordedAcceptedTurns: StartedTurn[] = [];
   #startedBeforeTurnRecorded: StartedTurn[] = [];
   readonly #stopping = new AbortController();
 
@@ -323,13 +323,7 @@ export class TaskService {
   > {
     const next = this.store.startNextTask(this.clock.now());
     if (next.kind !== "started") return next.kind;
-    const operation = this.#dispatchStartedTask(next.task);
-    this.#turnStartOperations.add(operation);
-    try {
-      return await operation;
-    } finally {
-      this.#turnStartOperations.delete(operation);
-    }
+    return this.#trackTurnStartOperation(this.#dispatchStartedTask(next.task));
   }
 
   async #dispatchStartedTask(task: QueuedTask): Promise<"started" | "paused"> {
@@ -482,15 +476,20 @@ export class TaskService {
     workspace: string,
     recordStarted: (turnId: string) => boolean,
   ): Promise<void> {
-    const operation = this.#performOwnedTurnStart(
-      threadId,
-      prompt,
-      workspace,
-      recordStarted,
+    await this.#trackTurnStartOperation(
+      this.#performOwnedTurnStart(
+        threadId,
+        prompt,
+        workspace,
+        recordStarted,
+      ),
     );
+  }
+
+  async #trackTurnStartOperation<T>(operation: Promise<T>): Promise<T> {
     this.#turnStartOperations.add(operation);
     try {
-      await operation;
+      return await operation;
     } finally {
       this.#turnStartOperations.delete(operation);
     }
