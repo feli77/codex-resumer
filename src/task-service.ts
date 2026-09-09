@@ -12,6 +12,7 @@ import type {
   CompletedTurn,
   RateLimitSnapshot,
   StartedTurn,
+  ThreadRecoverySnapshot,
   UnattendedRequest,
   UsageLimitExceeded,
 } from "./daemon.js";
@@ -91,8 +92,146 @@ export class TaskService {
   async restoreQueueRun(): Promise<void> {
     const queueRun = this.store.restoreQueueRun(this.clock.now());
     if (!queueRun) return;
-    await this.#continueQueueRun(queueRun.runPolicy, queueRun.accessMode)
-      .catch(() => undefined);
+    this.#accessMode = queueRun.accessMode;
+    this.#scheduleCutoff(queueRun.runPolicy);
+    const recoveryTask = this.store.readRecoveryTask();
+    if (
+      recoveryTask
+      && (!recoveryTask.managedThreadId || !recoveryTask.activeTurnId)
+    ) {
+      this.store.recordTaskNeedsAttention(
+        recoveryTask.id,
+        {
+          code: "turn_reconciliation_uncertain",
+          details: {
+            threadId: recoveryTask.managedThreadId ?? null,
+            turnId: recoveryTask.activeTurnId ?? null,
+          },
+          message: "The active Turn could not be confirmed after daemon restart.",
+        },
+        this.clock.now(),
+      );
+      return;
+    }
+    if (
+      recoveryTask
+      && recoveryTask.managedThreadId
+      && recoveryTask.activeTurnId
+    ) {
+      let thread: ThreadRecoverySnapshot;
+      try {
+        thread = await this.appServer.readThreadForReconciliation(
+          recoveryTask.managedThreadId,
+        );
+      } catch (error) {
+        this.#recordReconciliationUnavailable(recoveryTask.id, error);
+        return;
+      }
+      let turn = thread.turns.find(
+        (candidate) => candidate.turnId === recoveryTask.activeTurnId,
+      );
+      if (
+        recoveryTask.state === "running"
+        && thread.status === "active"
+        && turn?.status === "in_progress"
+      ) {
+        try {
+          await this.appServer.resumeThread(recoveryTask.managedThreadId);
+          thread = await this.appServer.readThreadForReconciliation(
+            recoveryTask.managedThreadId,
+          );
+          turn = thread.turns.find(
+            (candidate) => candidate.turnId === recoveryTask.activeTurnId,
+          );
+        } catch (error) {
+          this.#recordReconciliationUnavailable(recoveryTask.id, error);
+          return;
+        }
+        if (thread.status === "active" && turn?.status === "in_progress") return;
+      }
+      if (recoveryTask.state === "running" && turn?.status === "completed") {
+        this.#finishTurn({
+          status: "completed",
+          threadId: recoveryTask.managedThreadId,
+          turnId: recoveryTask.activeTurnId,
+        });
+        return;
+      }
+      if (recoveryTask.state === "running" && turn?.status === "interrupted") {
+        this.#finishTurn({
+          status: "interrupted",
+          threadId: recoveryTask.managedThreadId,
+          turnId: recoveryTask.activeTurnId,
+        });
+        return;
+      }
+      if (recoveryTask.state === "running" && turn?.status === "failed") {
+        if (turn.error?.codexErrorInfo === "usageLimitExceeded") {
+          this.#finishTurn({
+            status: "failed",
+            threadId: recoveryTask.managedThreadId,
+            turnId: recoveryTask.activeTurnId,
+            error: turn.error,
+          });
+        } else {
+          this.store.recordTurnNeedsAttention(
+            recoveryTask.managedThreadId,
+            recoveryTask.activeTurnId,
+            "failed",
+            {
+              code: "turn_failed",
+              ...(turn.error?.codexErrorInfo === undefined
+                ? {}
+                : { details: { codexErrorInfo: turn.error.codexErrorInfo } }),
+              message: turn.error?.message
+                ?? "Codex Turn failed; user action is required.",
+            },
+            this.clock.now(),
+          );
+        }
+        return;
+      }
+      if (
+        recoveryTask.state === "waiting_for_quota"
+        && turn?.status === "failed"
+        && turn.error?.codexErrorInfo === "usageLimitExceeded"
+      ) {
+        const quotaPause = this.store.readWaitingQuotaPause();
+        if (quotaPause) this.#scheduleQuotaRecovery(quotaPause);
+        return;
+      }
+      this.store.recordTaskNeedsAttention(
+        recoveryTask.id,
+        {
+          code: "turn_reconciliation_uncertain",
+          details: {
+            threadStatus: thread.status,
+            turnId: recoveryTask.activeTurnId,
+          },
+          message: "The active Turn could not be confirmed after daemon restart.",
+        },
+        this.clock.now(),
+      );
+      return;
+    }
+    const quotaPause = this.store.readWaitingQuotaPause();
+    if (quotaPause) {
+      this.#scheduleQuotaRecovery(quotaPause);
+      return;
+    }
+    await this.#startNextTask().catch(() => undefined);
+  }
+
+  #recordReconciliationUnavailable(taskId: number, error: unknown): void {
+    this.store.recordTaskNeedsAttention(
+      taskId,
+      {
+        code: "turn_reconciliation_unavailable",
+        details: { cause: serializeOperationalError(error) },
+        message: "The active Turn could not be read after daemon restart.",
+      },
+      this.clock.now(),
+    );
   }
 
   async #continueQueueRun(
@@ -112,6 +251,39 @@ export class TaskService {
   pause(): { state: "paused" } {
     this.store.pause(this.clock.now());
     return { state: "paused" };
+  }
+
+  async prepareStop(force: boolean): Promise<{ state: "stopping" }> {
+    const activeTask = this.store.readRecoveryTask();
+    if (activeTask?.state === "running" && !force) {
+      throw new Error(
+        "An active Turn is still running. Let it finish or use `daemon stop --force` to interrupt it.",
+      );
+    }
+    this.pause();
+    if (activeTask?.state === "running" && force) {
+      let interruptError;
+      if (activeTask.managedThreadId && activeTask.activeTurnId) {
+        try {
+          await this.appServer.interruptTurn(
+            activeTask.managedThreadId,
+            activeTask.activeTurnId,
+          );
+        } catch (error) {
+          interruptError = serializeOperationalError(error);
+        }
+      }
+      this.store.recordTaskNeedsAttention(
+        activeTask.id,
+        {
+          code: "daemon_force_stop",
+          ...(interruptError ? { details: { interruptError } } : {}),
+          message: "The active Turn was interrupted by forced daemon stop.",
+        },
+        this.clock.now(),
+      );
+    }
+    return { state: "stopping" };
   }
 
   async #startNextTask(): Promise<

@@ -18,6 +18,14 @@ interface FakeCodexOptions {
   externalTurnStarted?: boolean;
   omitClientRequest?: string;
   omitRateLimitResetTime?: boolean;
+  threadReadState?: {
+    status: "active" | "idle" | "notLoaded" | "systemError";
+    turns: Array<{
+      error?: { codexErrorInfo?: unknown; message: string };
+      id: string;
+      status: "completed" | "failed" | "inProgress" | "interrupted";
+    }>;
+  };
   turnStartRpcError?: { code: number; data?: unknown; message: string };
   turnCompletionDelayMs?: number;
   turnErrors?: Array<{ codexErrorInfo: string; message: string }>;
@@ -360,11 +368,12 @@ lines.on("line", (line) => {
     }
     const workspace = threads.get(message.params.threadId)
       ?? process.env.FAKE_CODEX_IMPORTED_WORKSPACE;
+    const threadReadState = ${JSON.stringify(options.threadReadState)};
     const thread = {
       id: message.params.threadId,
       cwd: workspace,
-      status: "idle",
-      turns: [],
+      status: threadReadState?.status ?? "idle",
+      turns: message.params.includeTurns ? threadReadState?.turns ?? [] : [],
     };
     threads.set(message.params.threadId, workspace);
     console.log(JSON.stringify({ id: message.id, result: { thread } }));

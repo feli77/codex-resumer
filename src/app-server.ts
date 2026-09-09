@@ -12,6 +12,7 @@ import type {
   CompletedTurn,
   RateLimitSnapshot,
   StartedTurn,
+  ThreadRecoverySnapshot,
   UnattendedRequest,
   UnattendedRequestKind,
   UsageLimitExceeded,
@@ -374,6 +375,28 @@ export class CodexAppServer implements AppServerController {
       throw new Error("Codex App Server returned an invalid Thread response");
     }
     return { threadId, workspace: result.thread.cwd };
+  }
+
+  async readThreadForReconciliation(
+    threadId: string,
+  ): Promise<ThreadRecoverySnapshot> {
+    const result = await this.#request("thread/read", {
+      threadId,
+      includeTurns: true,
+    });
+    if (
+      !isRecord(result)
+      || !isRecord(result.thread)
+      || result.thread.id !== threadId
+      || !Array.isArray(result.thread.turns)
+    ) {
+      throw new Error("Codex App Server returned an invalid Thread recovery response");
+    }
+    return {
+      status: parseThreadStatus(result.thread.status),
+      threadId,
+      turns: result.thread.turns.map(parseRecoveryTurn),
+    };
   }
 
   async resumeThread(threadId: string): Promise<{ threadId: string }> {
@@ -854,6 +877,44 @@ function parseTurnError(value: unknown): CompletedTurn["error"] {
     ...(value.codexErrorInfo === null || value.codexErrorInfo === undefined
       ? {}
       : { codexErrorInfo: value.codexErrorInfo }),
+  };
+}
+
+function parseThreadStatus(value: unknown): ThreadRecoverySnapshot["status"] {
+  const status = isRecord(value) ? value.type : value;
+  switch (status) {
+    case "active":
+    case "idle":
+      return status;
+    case "notLoaded":
+      return "not_loaded";
+    case "systemError":
+      return "system_error";
+    default:
+      throw new Error("Codex App Server returned an invalid Thread recovery status");
+  }
+}
+
+function parseRecoveryTurn(
+  value: unknown,
+): ThreadRecoverySnapshot["turns"][number] {
+  if (!isRecord(value) || typeof value.id !== "string") {
+    throw new Error("Codex App Server returned an invalid Turn recovery response");
+  }
+  const status = value.status === "inProgress" ? "in_progress" : value.status;
+  if (
+    status !== "completed"
+    && status !== "failed"
+    && status !== "interrupted"
+    && status !== "in_progress"
+  ) {
+    throw new Error("Codex App Server returned an invalid Turn recovery status");
+  }
+  const error = parseTurnError(value.error);
+  return {
+    status,
+    turnId: value.id,
+    ...(error ? { error } : {}),
   };
 }
 

@@ -60,6 +60,13 @@ export interface TransientRetry {
   workspace: string;
 }
 
+export interface RecoveryTask {
+  activeTurnId: string | undefined;
+  id: number;
+  managedThreadId: string | undefined;
+  state: "running" | "waiting_for_quota";
+}
+
 export interface TaskCancellation {
   interrupt?: { threadId: string; turnId: string };
   taskId: number;
@@ -292,6 +299,28 @@ export class StateStore {
         } as const,
       };
     })();
+  }
+
+  readRecoveryTask(): RecoveryTask | undefined {
+    const task = this.#database.prepare(`
+      SELECT id, state, managed_thread_id, active_turn_id
+      FROM tasks
+      WHERE state IN ('running', 'waiting_for_quota')
+      LIMIT 1
+    `).get() as {
+      active_turn_id: string | null;
+      id: number;
+      managed_thread_id: string | null;
+      state: "running" | "waiting_for_quota";
+    } | undefined;
+    return task
+      ? {
+        activeTurnId: task.active_turn_id ?? undefined,
+        id: task.id,
+        managedThreadId: task.managed_thread_id ?? undefined,
+        state: task.state,
+      }
+      : undefined;
   }
 
   addWorkspaceTask(workspace: string, prompt: string, now: Date): number {

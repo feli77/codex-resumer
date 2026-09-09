@@ -21,6 +21,7 @@ import {
   startQueueRun,
   type AppServerController,
   type CompletedTurn,
+  type ThreadRecoverySnapshot,
   type UnattendedRequest,
 } from "../src/daemon.js";
 import { resolvePaths } from "../src/paths.js";
@@ -90,6 +91,7 @@ class FakeAppServer implements AppServerController {
   readonly turnStartErrors: Array<Error | undefined> = [];
   readonly turnAccess: Array<{ accessMode: AccessMode; workspace: string }> = [];
   readonly turns: Array<{ prompt: string; threadId: string; turnId: string }> = [];
+  recoveryThread: ThreadRecoverySnapshot | undefined;
   startThreadCalls = 0;
   startThreadWait: Promise<void> | undefined;
   #completedListeners = new Set<(turn: CompletedTurn) => void>();
@@ -108,6 +110,11 @@ class FakeAppServer implements AppServerController {
 
   async readThread(): Promise<{ threadId: string; workspace: string }> {
     throw new Error("not used");
+  }
+
+  async readThreadForReconciliation(): Promise<ThreadRecoverySnapshot> {
+    if (!this.recoveryThread) throw new Error("recovery Thread is unavailable");
+    return this.recoveryThread;
   }
 
   async resumeThread(threadId: string) {
@@ -403,6 +410,15 @@ test("daemon restart preserves Full Access confirmation for a Continuation", asy
   await daemon.close();
 
   const replacementAppServer = new FakeAppServer();
+  replacementAppServer.recoveryThread = {
+    status: "idle",
+    threadId: "thread-quota",
+    turns: [{
+      error: { codexErrorInfo: "usageLimitExceeded", message: "quota reached" },
+      status: "failed",
+      turnId: "turn-1",
+    }],
+  };
   replacementAppServer.rateLimitReads.push(
     rateLimits({ codex: bucket("codex", null, 10, null) }),
   );

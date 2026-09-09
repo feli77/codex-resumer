@@ -34,7 +34,9 @@ import type { QueueSnapshot } from "./state-store.js";
 import { resolvePaths, type DaemonPaths } from "./paths.js";
 
 const usage = `Usage:
-  codex-resumer daemon <start|stop|status>
+  codex-resumer daemon start
+  codex-resumer daemon stop [--force]
+  codex-resumer daemon status
   codex-resumer task add (--workspace <path> | --thread <thread-id>) [<prompt>]
   codex-resumer task <list|cancel <task-id>|complete <task-id>>
   codex-resumer task retry <task-id> [<new-prompt>]
@@ -57,21 +59,28 @@ async function main(args: string[]): Promise<number> {
     return 0;
   }
   const paths = resolvePaths();
-  if (args[0] === "daemon" && args[1] && args.length === 2) {
+  if (args[0] === "daemon" && args[1]) {
     switch (args[1]) {
       case "start":
+        if (args.length !== 2) break;
         return startDetached(paths);
       case "stop": {
-        const result = await stopDaemon(paths);
+        if (
+          args.length !== 2
+          && !(args.length === 3 && args[2] === "--force")
+        ) break;
+        const result = await stopDaemon(paths, args[2] === "--force");
         process.stdout.write(
           result === "stopped" ? "Daemon stopped.\n" : "Daemon is already stopped.\n",
         );
         return 0;
       }
       case "status":
+        if (args.length !== 2) break;
         process.stdout.write(`${renderStatus(await getDaemonStatus(paths))}\n`);
         return 0;
       case "run":
+        if (args.length !== 2) break;
         return runForeground(paths);
     }
   }

@@ -19,6 +19,7 @@ const unusedTaskExecution: Pick<
   | "interruptTurn"
   | "readRateLimits"
   | "readThread"
+  | "readThreadForReconciliation"
   | "resumeThread"
   | "startThread"
   | "startTurn"
@@ -32,6 +33,9 @@ const unusedTaskExecution: Pick<
     return { rateLimits: null, rateLimitsByLimitId: null };
   },
   async readThread() {
+    throw new Error("not used by daemon lifecycle tests");
+  },
+  async readThreadForReconciliation() {
     throw new Error("not used by daemon lifecycle tests");
   },
   async resumeThread() {
@@ -365,6 +369,35 @@ test("daemon probes the installed App Server protocol and current ChatGPT login"
       .map((record) => record.message?.method),
     ["initialize", "initialized", "account/read", "account/rateLimits/read"],
   );
+});
+
+test("App Server reads structured Thread and Turn state for restart reconciliation", async (t) => {
+  const { root } = await createTestEnvironment();
+  const fakeCodex = await createFakeCodex(root, {
+    threadReadState: {
+      status: "active",
+      turns: [{ id: "turn-recovery", status: "inProgress" }],
+    },
+  });
+  const appServer = new CodexAppServer({
+    command: fakeCodex.command,
+    env: {
+      ...process.env,
+      FAKE_CODEX_IMPORTED_WORKSPACE: root,
+      FAKE_CODEX_LOG: fakeCodex.logPath,
+    },
+  });
+  t.after(async () => {
+    await appServer.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  assert.equal((await appServer.startAndProbe()).state, "ready");
+
+  assert.deepEqual(await appServer.readThreadForReconciliation("thread-recovery"), {
+    status: "active",
+    threadId: "thread-recovery",
+    turns: [{ status: "in_progress", turnId: "turn-recovery" }],
+  });
 });
 
 test("installed protocol probe names a missing required capability", async (t) => {

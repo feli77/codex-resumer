@@ -66,7 +66,9 @@ async function createCliTestEnvironment(
       child.stdin.end(input);
     });
   t.after(async () => {
-    await runCli("daemon", "stop").catch(() => undefined);
+    await runCli("daemon", "stop", "--force").catch(async () => {
+      await runCli("daemon", "stop").catch(() => undefined);
+    });
     await rm(root, { recursive: true, force: true });
   });
   return {
@@ -554,6 +556,84 @@ test("Queue start, pause, and resume never duplicate the active Turn", async (t)
     .map((line) => JSON.parse(line) as { message?: { method?: string } });
   assert.equal(
     records.filter((record) => record.message?.method === "turn/start").length,
+    1,
+  );
+});
+
+test("normal daemon stop pauses the Queue until an explicit resume", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurnSynchronously: true,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Finish before stop");
+  await runCli("queue", "start", "--until-idle");
+  await waitForQueueStatus(runCli, "Task 1: completed");
+  await runCli("task", "add", "--workspace", workspace, "Wait for resume");
+
+  assert.equal(await runCli("daemon", "stop"), "Daemon stopped.\n");
+  assert.equal(await runCli("daemon", "start"), "Daemon started.\n");
+  const status = await runCli("queue", "status");
+  assert.match(status, /Queue is paused\.[\s\S]*Pause reason: manual pause/);
+  assert.match(status, /Task 2: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
+    1,
+  );
+});
+
+test("normal daemon stop refuses while a Turn is active", async (t) => {
+  const { fakeCodex, runCli, runCliResult, workspace } =
+    await createCliTestEnvironment(t, { completeTurn: false });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Keep running");
+  await runCli("queue", "start", "--until-idle");
+
+  await assert.rejects(
+    runCliResult("daemon", "stop"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && "stderr" in error);
+      assert.match(String(error.stderr), /active Turn is still running/i);
+      assert.match(String(error.stderr), /daemon stop --force/i);
+      return true;
+    },
+  );
+  assert.match(await runCli("daemon", "status"), /Daemon is running/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/interrupt").length,
+    0,
+  );
+});
+
+test("daemon stop --force interrupts the active Turn and pauses before exiting", async (t) => {
+  const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
+    completeTurn: false,
+  });
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, "Interrupt this");
+  await runCli("task", "add", "--workspace", workspace, "Do not start");
+  await runCli("queue", "start", "--until-idle");
+
+  assert.equal(await runCli("daemon", "stop", "--force"), "Daemon stopped.\n");
+  const messagesAfterStop = await readFakeMessages(fakeCodex.logPath);
+  assert.deepEqual(
+    messagesAfterStop
+      .filter((message) => message.method === "turn/interrupt")
+      .map((message) => message.params),
+    [{ threadId: "thread-fake", turnId: "turn-fake" }],
+  );
+
+  await runCli("daemon", "start");
+  const status = await runCli("queue", "status");
+  assert.match(status, /Queue is paused\.[\s\S]*Pause reason: Needs Attention/);
+  assert.match(status, /Task 1: needs_attention[\s\S]*Task 2: queued/);
+  assert.equal(
+    (await readFakeMessages(fakeCodex.logPath))
+      .filter((message) => message.method === "turn/start").length,
     1,
   );
 });

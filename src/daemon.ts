@@ -63,10 +63,21 @@ export interface StartedTurn {
   turnId: string;
 }
 
+export interface ThreadRecoverySnapshot {
+  status: "active" | "idle" | "not_loaded" | "system_error";
+  threadId: string;
+  turns: Array<{
+    error?: TurnError;
+    status: "completed" | "failed" | "in_progress" | "interrupted";
+    turnId: string;
+  }>;
+}
+
 export interface AppServerController {
   startAndProbe(): Promise<AppServerProbeResult>;
   readRateLimits(): Promise<AccountRateLimits>;
   readThread(threadId: string): Promise<{ threadId: string; workspace: string }>;
+  readThreadForReconciliation(threadId: string): Promise<ThreadRecoverySnapshot>;
   resumeThread(threadId: string): Promise<{ threadId: string }>;
   startThread(workspace: string): Promise<{ threadId: string }>;
   startTurn(
@@ -443,13 +454,30 @@ export async function getDaemonStatus(paths: DaemonPaths): Promise<DaemonStatus>
 
 export async function stopDaemon(
   paths: DaemonPaths,
+  force = false,
 ): Promise<"stopped" | "already-stopped"> {
+  let response: { result?: unknown; error?: unknown };
   try {
-    const response = await sendRequest(paths.socketPath, { method: "stop" });
-    if (!isRecord(response.result) || response.result.state !== "stopping") {
-      return "already-stopped";
-    }
+    response = await sendRequest(paths.socketPath, {
+      method: "stop",
+      params: { force },
+    });
   } catch {
+    return "already-stopped";
+  }
+  if (typeof response.error === "string") throw new Error(response.error);
+  if (
+    isRecord(response.error)
+    && typeof response.error.code === "string"
+    && typeof response.error.message === "string"
+  ) {
+    throw new DaemonRequestError(
+      response.error.message,
+      response.error.code,
+      response.error.details,
+    );
+  }
+  if (!isRecord(response.result) || response.result.state !== "stopping") {
     return "already-stopped";
   }
 
@@ -576,7 +604,14 @@ function handleConnection(
       if (request.method === "status") {
         socket.end(`${JSON.stringify({ result: status })}\n`);
       } else if (request.method === "stop") {
-        socket.end(`${JSON.stringify({ result: { state: "stopping" } })}\n`, onStop);
+        const force = isRecord(request.params) && request.params.force === true;
+        void taskService.prepareStop(force)
+          .then((result) => {
+            socket.end(`${JSON.stringify({ result })}\n`, onStop);
+          })
+          .catch((error: unknown) => {
+            socket.end(`${JSON.stringify({ error: serializeOperationalError(error) })}\n`);
+          });
       } else {
         void handleTaskRequest(request, taskService)
           .then((result) => socket.end(`${JSON.stringify({ result })}\n`))

@@ -39,6 +39,7 @@ The daemon commands are:
 codex-resumer daemon start
 codex-resumer daemon status
 codex-resumer daemon stop
+codex-resumer daemon stop --force
 ```
 
 Add Tasks for new Threads in a Workspace, start the Queue, and inspect its state:
@@ -187,6 +188,20 @@ capabilities it needs. It then verifies the current ChatGPT account and reads
 the current rate-limit state. An incompatible App Server or missing ChatGPT
 login prevents the daemon from accepting work, and `daemon status` reports the
 reason together with the installed Codex version.
+
+After an unexpected daemon exit, startup reconciles the active Task against the
+Turn history reported by App Server. A still-active Turn is resumed for event
+listening without submitting another prompt. A successful Turn completes the
+Task, and a structured usage-limit failure returns to Quota Pause recovery.
+Interrupted, failed, idle-without-success, unavailable, or otherwise uncertain
+state becomes Needs Attention. The existing Queue Run and its confirmed Access
+Mode remain in effect only for this unexpected-restart recovery.
+
+A normal `daemon stop` pauses the Queue and ends its Queue Run, so later work
+requires an explicit `queue resume` and a new Access Mode confirmation. Normal
+stop refuses while a Turn is active and explains how to let it finish or force
+the stop. `daemon stop --force` interrupts the active Turn, records the Task as
+Needs Attention, pauses the Queue, and exits.
 
 ## Local data and permissions
 
