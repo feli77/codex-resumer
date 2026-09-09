@@ -39,7 +39,8 @@ export class TaskService {
   #transientRetry: Promise<void> = Promise.resolve();
   #unattendedBeforeTurnStart: UnattendedRequest | undefined;
   #turnStartsInProgress = new Set<string>();
-  #turnStartOperations = new Set<Promise<void>>();
+  #turnStartOperations = new Set<Promise<unknown>>();
+  #unrecordedAcceptedTurns: Array<{ threadId: string; turnId: string }> = [];
   #startedBeforeTurnRecorded: StartedTurn[] = [];
   readonly #stopping = new AbortController();
 
@@ -258,34 +259,61 @@ export class TaskService {
 
   async prepareStop(force: boolean): Promise<{ state: "stopping" }> {
     this.pause();
-    await Promise.all(this.#turnStartOperations);
+    await Promise.allSettled(this.#turnStartOperations);
     const activeTask = this.store.readRecoveryTask();
-    if (activeTask?.state === "running" && !force) {
+    if (
+      !force
+      && (
+        activeTask?.state === "running"
+        || this.#unrecordedAcceptedTurns.length > 0
+      )
+    ) {
       throw new Error(
         "An active Turn is still running. Let it finish or use `daemon stop --force` to interrupt it.",
       );
     }
-    if (activeTask?.state === "running" && force) {
+    if (force) {
+      const turnsToInterrupt = [...this.#unrecordedAcceptedTurns];
+      if (
+        activeTask?.state === "running"
+        && activeTask.managedThreadId
+        && activeTask.activeTurnId
+      ) {
+        turnsToInterrupt.push({
+          threadId: activeTask.managedThreadId,
+          turnId: activeTask.activeTurnId,
+        });
+      }
       let interruptError;
-      if (activeTask.managedThreadId && activeTask.activeTurnId) {
+      for (const turn of turnsToInterrupt) {
         try {
           await this.appServer.interruptTurn(
-            activeTask.managedThreadId,
-            activeTask.activeTurnId,
+            turn.threadId,
+            turn.turnId,
           );
         } catch (error) {
           interruptError = serializeOperationalError(error);
         }
       }
-      this.store.recordTaskNeedsAttention(
-        activeTask.id,
-        {
-          code: "daemon_force_stop",
-          ...(interruptError ? { details: { interruptError } } : {}),
-          message: "The active Turn was interrupted by forced daemon stop.",
-        },
-        this.clock.now(),
-      );
+      if (
+        activeTask
+        && (
+          activeTask.state === "running"
+          || this.#unrecordedAcceptedTurns.length > 0
+        )
+      ) {
+        this.store.recordTaskNeedsAttention(
+          activeTask.id,
+          {
+            code: "daemon_force_stop",
+            ...(interruptError ? { details: { interruptError } } : {}),
+            message: turnsToInterrupt.length > 0
+              ? "The active Turn was interrupted by forced daemon stop."
+              : "The active Turn could not be confirmed during forced daemon stop.",
+          },
+          this.clock.now(),
+        );
+      }
     }
     return { state: "stopping" };
   }
@@ -295,18 +323,28 @@ export class TaskService {
   > {
     const next = this.store.startNextTask(this.clock.now());
     if (next.kind !== "started") return next.kind;
+    const operation = this.#dispatchStartedTask(next.task);
+    this.#turnStartOperations.add(operation);
     try {
-      await accessibleWorkspace(next.task.workspace);
-      if (!await this.dispatch(next.task)) return "paused";
+      return await operation;
+    } finally {
+      this.#turnStartOperations.delete(operation);
+    }
+  }
+
+  async #dispatchStartedTask(task: QueuedTask): Promise<"started" | "paused"> {
+    try {
+      await accessibleWorkspace(task.workspace);
+      if (!await this.dispatch(task)) return "paused";
+      return "started";
     } catch (error) {
       this.store.releaseTaskBeforeDispatch(
-        next.task.id,
+        task.id,
         serializeOperationalError(error),
         this.clock.now(),
       );
       throw error;
     }
-    return "started";
   }
 
   snapshot(): QueueSnapshot {
@@ -472,7 +510,12 @@ export class TaskService {
         workspace,
         this.#requiredAccessMode(),
       );
+      const acceptedTurn = { threadId, turnId };
+      this.#unrecordedAcceptedTurns.push(acceptedTurn);
       if (!recordStarted(turnId)) return;
+      this.#unrecordedAcceptedTurns = this.#unrecordedAcceptedTurns.filter(
+        (candidate) => candidate !== acceptedTurn,
+      );
       this.#reconcileTurnStart(threadId, turnId);
     } finally {
       this.#turnStartsInProgress.delete(threadId);

@@ -30,6 +30,7 @@ class ReconciliationAppServer implements AppServerController {
   readonly rateLimitReads: AccountRateLimits[] = [];
   readonly resumedThreads: string[] = [];
   readonly startedTurns: Array<{ prompt: string; threadId: string }> = [];
+  startTurnError: Error | undefined;
   startTurnCalls = 0;
   startTurnWait: Promise<void> | undefined;
   observedThread: ObservedThread | undefined;
@@ -76,6 +77,7 @@ class ReconciliationAppServer implements AppServerController {
   async startTurn(threadId: string, prompt: string) {
     this.startTurnCalls += 1;
     await this.startTurnWait;
+    if (this.startTurnError) throw this.startTurnError;
     this.startedTurns.push({ prompt, threadId });
     return { turnId: this.nextTurnId };
   }
@@ -406,13 +408,8 @@ test("normal stop waits for an in-flight Turn start before refusing", async (t) 
   const { appServer, paths, releaseTurnStart, starting } =
     await createInFlightTurnEnvironment(t);
 
-  let stopSettled = false;
   const stopping = stopDaemon(paths);
-  void stopping.finally(() => {
-    stopSettled = true;
-  }).catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(stopSettled, false);
+  await assertStillPending(stopping);
 
   releaseTurnStart();
   await starting;
@@ -424,13 +421,8 @@ test("forced stop interrupts a Turn accepted while stop is waiting", async (t) =
   const { appServer, daemons, paths, releaseTurnStart, starting } =
     await createInFlightTurnEnvironment(t);
 
-  let stopSettled = false;
   const stopping = stopDaemon(paths, true);
-  void stopping.finally(() => {
-    stopSettled = true;
-  }).catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(stopSettled, false);
+  await assertStillPending(stopping);
   releaseTurnStart();
   await starting;
   assert.equal(await stopping, "stopped");
@@ -445,6 +437,68 @@ test("forced stop interrupts a Turn accepted while stop is waiting", async (t) =
   if (replacement.kind !== "started") throw new Error("replacement did not start");
   daemons.push(replacement.daemon);
   const snapshot = await getQueueStatus(paths);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "needs_attention");
+});
+
+test("normal stop completes after an in-flight Turn start fails", async (t) => {
+  const { appServer, daemons, paths, releaseTurnStart, starting } =
+    await createInFlightTurnEnvironment(t);
+  appServer.startTurnError = new Error("turn/start failed");
+
+  const stopping = stopDaemon(paths);
+  await assertStillPending(stopping);
+  releaseTurnStart();
+  await assert.rejects(starting, /turn\/start failed/);
+  assert.equal(await stopping, "stopped");
+
+  const snapshot = await restartAndReadSnapshot(paths, daemons);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "needs_attention");
+  assert.deepEqual(appServer.interruptedTurns, []);
+});
+
+test("forced stop completes after an in-flight Turn start fails", async (t) => {
+  const { appServer, daemons, paths, releaseTurnStart, starting } =
+    await createInFlightTurnEnvironment(t);
+  appServer.startTurnError = new Error("turn/start failed");
+
+  const stopping = stopDaemon(paths, true);
+  await assertStillPending(stopping);
+  releaseTurnStart();
+  await assert.rejects(starting, /turn\/start failed/);
+  assert.equal(await stopping, "stopped");
+
+  const snapshot = await restartAndReadSnapshot(paths, daemons);
+  assert.equal(snapshot.state, "paused");
+  assert.equal(snapshot.tasks[0]?.state, "needs_attention");
+  assert.deepEqual(appServer.interruptedTurns, []);
+});
+
+test("forced stop interrupts an accepted Turn whose local record fails", async (t) => {
+  const { appServer, daemons, paths, releaseTurnStart, starting } =
+    await createInFlightTurnEnvironment(t);
+  const database = new Database(paths.databasePath);
+  database.exec(`
+    CREATE TRIGGER reject_turn_record
+    BEFORE INSERT ON turns
+    BEGIN
+      SELECT RAISE(FAIL, 'local Turn record failed');
+    END
+  `);
+  database.close();
+
+  const stopping = stopDaemon(paths, true);
+  await assertStillPending(stopping);
+  releaseTurnStart();
+  await assert.rejects(starting, /local Turn record failed/);
+  assert.equal(await stopping, "stopped");
+  assert.deepEqual(appServer.interruptedTurns, [{
+    threadId: "thread-recovery",
+    turnId: "turn-1",
+  }]);
+
+  const snapshot = await restartAndReadSnapshot(paths, daemons);
   assert.equal(snapshot.state, "paused");
   assert.equal(snapshot.tasks[0]?.state, "needs_attention");
 });
@@ -541,6 +595,29 @@ async function createInFlightTurnEnvironment(t: TestContext) {
     releaseTurnStart: () => releaseTurnStart?.(),
     starting,
   };
+}
+
+async function restartAndReadSnapshot(
+  paths: ReturnType<typeof resolvePaths>,
+  daemons: Array<{ close(): Promise<void> }>,
+) {
+  const replacement = await startDaemon({
+    appServer: new ReconciliationAppServer(),
+    paths,
+  });
+  assert.equal(replacement.kind, "started");
+  if (replacement.kind !== "started") throw new Error("replacement did not start");
+  daemons.push(replacement.daemon);
+  return getQueueStatus(paths);
+}
+
+async function assertStillPending(promise: Promise<unknown>): Promise<void> {
+  let settled = false;
+  void promise.finally(() => {
+    settled = true;
+  }).catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(settled, false);
 }
 
 async function waitForTaskState(
