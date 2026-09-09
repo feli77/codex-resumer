@@ -377,6 +377,11 @@ test("daemon restart cannot bypass an expired Cutoff Time", async (t) => {
   clock.advanceTo("2026-09-04T10:20:00.000Z");
 
   const replacementAppServer = new FakeAppServer();
+  replacementAppServer.recoveryThread = {
+    status: "active",
+    threadId: "thread-quota",
+    turns: [{ status: "in_progress", turnId: "turn-1" }],
+  };
   const replacement = await startDaemon({
     appServer: replacementAppServer,
     clock,

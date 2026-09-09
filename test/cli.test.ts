@@ -36,7 +36,10 @@ test("CLI starts one detached daemon, reports it, and stops it", async (t) => {
     await rm(root, { recursive: true, force: true });
   });
 
-  assert.match(await runCli("--help"), /codex-resumer daemon <start\|stop\|status>/);
+  const help = await runCli("--help");
+  assert.match(help, /codex-resumer daemon start/);
+  assert.match(help, /codex-resumer daemon stop \[--force\]/);
+  assert.match(help, /codex-resumer daemon status/);
   assert.match(await runCli("daemon", "start"), /Daemon started/);
   assert.match(await runCli("daemon", "start"), /already running/);
   assert.match(await runCli("daemon", "status"), /Daemon is running.*codex-cli 9\.fake/);
