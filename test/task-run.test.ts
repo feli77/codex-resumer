@@ -196,6 +196,10 @@ test("a Workspace Task runs once and completes without an output marker", async 
   assert.match(status, /Task 1: completed/);
   assert.match(status, /Thread thread-fake, Turn turn-fake/);
   assert.doesNotMatch(status, /Create a note/);
+  assert.match(
+    status,
+    /Next: run `codex-resumer task add --workspace \. "<prompt>"`, then `codex-resumer queue start --until-idle`\./,
+  );
 
   const records = (await readFile(fakeCodex.logPath, "utf8"))
     .trim()
@@ -672,6 +676,23 @@ test("Queue start, pause, and resume never duplicate the active Turn", async (t)
     await runCli("queue", "status"),
     /Queue is paused\.[\s\S]*Pause reason: manual pause/,
   );
+  const manualPause = (await runCli("logs", "read"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((event) => {
+      const transition = event.stateTransition as Record<string, unknown> | undefined;
+      return event.eventType === "queue.state_changed" && transition?.to === "paused";
+    })
+    .at(-1);
+  assert.deepEqual(
+    {
+      taskId: manualPause?.taskId,
+      threadId: manualPause?.threadId,
+      turnId: manualPause?.turnId,
+    },
+    { taskId: 1, threadId: "thread-fake", turnId: "turn-fake" },
+  );
   assert.equal(
     await runCli("queue", "resume", "--until-idle"),
     "Queue resumed.\n",
@@ -1023,6 +1044,7 @@ test("external Managed Thread activity pauses without interrupting the owned Tur
   assert.deepEqual(
     {
       errorSummary: externalActivity?.errorSummary,
+      taskId: externalActivity?.taskId,
       threadId: externalActivity?.threadId,
       turnId: externalActivity?.turnId,
     },
@@ -1031,6 +1053,7 @@ test("external Managed Thread activity pauses without interrupting the owned Tur
         code: "external_thread_activity",
         message: "An operational error was recorded; inspect Queue status for details.",
       },
+      taskId: 1,
       threadId: "thread-fake",
       turnId: "turn-external",
     },

@@ -988,11 +988,17 @@ export class StateStore {
       this.#database.prepare(`
         SELECT codex_resumer_event(json_object(
           'eventType', 'thread.external_activity',
+          'taskId', (
+            SELECT id FROM tasks
+            WHERE managed_thread_id = ?
+              AND state IN ('running', 'waiting_for_quota')
+            LIMIT 1
+          ),
           'threadId', ?,
           'turnId', ?,
           'errorCode', 'external_thread_activity'
         ))
-      `).get(managedThreadId, turnId);
+      `).get(managedThreadId, managedThreadId, turnId);
       return true;
     })();
   }
@@ -1188,12 +1194,15 @@ export class StateStore {
       BEGIN
         SELECT codex_resumer_event(json_object(
           'eventType', 'queue.state_changed',
-          'taskId', (SELECT id FROM tasks WHERE state = 'needs_attention'
-            ORDER BY queue_position, id LIMIT 1),
-          'threadId', (SELECT managed_thread_id FROM tasks WHERE state = 'needs_attention'
-            ORDER BY queue_position, id LIMIT 1),
-          'turnId', (SELECT active_turn_id FROM tasks WHERE state = 'needs_attention'
-            ORDER BY queue_position, id LIMIT 1),
+          'taskId', (SELECT id FROM tasks
+            WHERE state IN ('needs_attention', 'running', 'waiting_for_quota')
+            ORDER BY state = 'needs_attention' DESC, queue_position, id LIMIT 1),
+          'threadId', (SELECT managed_thread_id FROM tasks
+            WHERE state IN ('needs_attention', 'running', 'waiting_for_quota')
+            ORDER BY state = 'needs_attention' DESC, queue_position, id LIMIT 1),
+          'turnId', (SELECT active_turn_id FROM tasks
+            WHERE state IN ('needs_attention', 'running', 'waiting_for_quota')
+            ORDER BY state = 'needs_attention' DESC, queue_position, id LIMIT 1),
           'fromState', OLD.state,
           'toState', NEW.state,
           'errorCode', NEW.error_code

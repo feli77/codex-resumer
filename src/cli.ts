@@ -379,7 +379,7 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
     lines.push("Next: run `codex-resumer queue resume --until-idle` when ready.");
   } else if (snapshot.state === "idle") {
     lines.push(
-      "Next: add a Task with `codex-resumer task add`, then start the Queue.",
+      "Next: run `codex-resumer task add --workspace . \"<prompt>\"`, then `codex-resumer queue start --until-idle`.",
     );
   } else {
     lines.push("Next: run `codex-resumer queue pause` to stop starting new Turns.");
