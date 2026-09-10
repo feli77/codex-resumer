@@ -605,17 +605,21 @@ test("unattended App Server requests are safely rejected and never approved", as
     await settle();
   }
 
-  const responses = (await readFile(fakeCodex.logPath, "utf8"))
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line) as {
-      message?: { id?: number | string; result?: unknown };
-    })
-    .map((record) => record.message)
-    .filter((message) =>
-      typeof message?.id === "string"
-      || (typeof message?.id === "number" && message.id >= 1000)
-    );
+  let responses: Array<{ id?: number | string; result?: unknown } | undefined> = [];
+  for (let attempt = 0; attempt < 100 && responses.length < methods.length; attempt += 1) {
+    responses = (await readFile(fakeCodex.logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as {
+        message?: { id?: number | string; result?: unknown };
+      })
+      .map((record) => record.message)
+      .filter((message) =>
+        typeof message?.id === "string"
+        || (typeof message?.id === "number" && message.id >= 1000)
+      );
+    if (responses.length < methods.length) await settle();
+  }
   assert.deepEqual(requests, [
     "command_approval",
     "file_change_approval",
