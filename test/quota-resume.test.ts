@@ -504,6 +504,24 @@ test("a structured quota pause waits for the matching reset before continuing in
     state: "waiting_for_quota",
     workspace,
   });
+  const quotaEvent = (await readFile(paths.eventLogPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((event) => {
+      const transition = event.stateTransition as Record<string, unknown> | undefined;
+      return event.eventType === "task.state_changed"
+        && transition?.to === "waiting_for_quota";
+    });
+  assert.deepEqual(quotaEvent, {
+    eventType: "task.state_changed",
+    quotaResetAt: "2026-09-04T10:05:00.000Z",
+    stateTransition: { from: "running", to: "waiting_for_quota" },
+    taskId: 1,
+    threadId: "thread-quota",
+    timestamp: "2026-09-04T10:00:00.000Z",
+    turnId: "turn-1",
+  });
 
   clock.advanceTo("2026-09-04T10:05:00.000Z");
   await settle();

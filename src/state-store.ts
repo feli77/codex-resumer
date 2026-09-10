@@ -3,6 +3,7 @@ import { chmodSync } from "node:fs";
 import Database from "better-sqlite3";
 
 import type { AccessMode } from "./config.js";
+import { EventLog, sanitizedErrorSummary } from "./event-log.js";
 import type { RunPolicy } from "./run-policy.js";
 import type { StructuredError } from "./structured-error.js";
 
@@ -170,9 +171,39 @@ function createActiveTaskIndex(ifMissing = false): string {
 export class StateStore {
   readonly #database: Database.Database;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, eventLog?: EventLog) {
     this.#database = new Database(databasePath);
     chmodSync(databasePath, 0o600);
+    this.#database.function(
+      "codex_resumer_event",
+      (
+        eventType: string,
+        taskId: number | null,
+        threadId: string | null,
+        turnId: string | null,
+        fromState: string | null,
+        toState: string | null,
+        quotaResetAt: string | null,
+        errorCode: string | null,
+      ) => {
+        if (eventLog) {
+          eventLog.record({
+            eventType,
+            ...(taskId === null ? {} : { taskId }),
+            ...(threadId === null ? {} : { threadId }),
+            ...(turnId === null ? {} : { turnId }),
+            ...(toState === null
+              ? {}
+              : { stateTransition: { from: fromState, to: toState } }),
+            ...(quotaResetAt === null ? {} : { quotaResetAt }),
+            ...(errorCode === null
+              ? {}
+              : { errorSummary: sanitizedErrorSummary(errorCode) }),
+          });
+        }
+        return 0;
+      },
+    );
     this.#database.pragma("foreign_keys = ON");
     this.#database.exec(`
       CREATE TABLE IF NOT EXISTS queue (
@@ -217,6 +248,7 @@ export class StateStore {
     this.#migrateQueuePauseReason();
     this.#migrateQueueError();
     this.#migrateQueueRunAccessMode();
+    this.#installEventLogTriggers();
     this.#database.prepare(`
       INSERT OR IGNORE INTO queue (id, state, pause_reason, updated_at)
       VALUES (1, 'paused', 'not_started', ?)
@@ -1079,6 +1111,103 @@ export class StateStore {
 
   close(): void {
     this.#database.close();
+  }
+
+  #installEventLogTriggers(): void {
+    this.#database.exec(`
+      CREATE TRIGGER IF NOT EXISTS event_log_task_insert
+      AFTER INSERT ON tasks
+      BEGIN
+        SELECT codex_resumer_event(
+          'task.state_changed', NEW.id, NEW.managed_thread_id,
+          NEW.active_turn_id, NULL, NEW.state, NEW.quota_reset_at, NULL
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_task_state
+      AFTER UPDATE OF state ON tasks
+      WHEN OLD.state IS NOT NEW.state
+      BEGIN
+        SELECT codex_resumer_event(
+          'task.state_changed', NEW.id, NEW.managed_thread_id,
+          NEW.active_turn_id, OLD.state, NEW.state, NEW.quota_reset_at, NULL
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_turn_insert
+      AFTER INSERT ON turns
+      BEGIN
+        SELECT codex_resumer_event(
+          'turn.state_changed', NEW.task_id, NEW.managed_thread_id,
+          NEW.id, NULL, NEW.state, NULL, NULL
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_turn_state
+      AFTER UPDATE OF state ON turns
+      WHEN OLD.state IS NOT NEW.state
+      BEGIN
+        SELECT codex_resumer_event(
+          'turn.state_changed', NEW.task_id, NEW.managed_thread_id,
+          NEW.id, OLD.state, NEW.state, NULL, NULL
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_queue_insert
+      AFTER INSERT ON queue
+      BEGIN
+        SELECT codex_resumer_event(
+          'queue.state_changed', NULL, NULL, NULL,
+          NULL, NEW.state, NULL, NEW.error_code
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_queue_update
+      AFTER UPDATE OF state, pause_reason, error_code ON queue
+      WHEN OLD.state IS NOT NEW.state
+        OR OLD.pause_reason IS NOT NEW.pause_reason
+        OR OLD.error_code IS NOT NEW.error_code
+      BEGIN
+        SELECT codex_resumer_event(
+          'queue.state_changed',
+          (SELECT id FROM tasks WHERE state = 'needs_attention'
+            ORDER BY queue_position, id LIMIT 1),
+          (SELECT managed_thread_id FROM tasks WHERE state = 'needs_attention'
+            ORDER BY queue_position, id LIMIT 1),
+          (SELECT active_turn_id FROM tasks WHERE state = 'needs_attention'
+            ORDER BY queue_position, id LIMIT 1),
+          OLD.state, NEW.state, NULL, NEW.error_code
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_queue_run_insert
+      AFTER INSERT ON queue_runs
+      BEGIN
+        SELECT codex_resumer_event(
+          'queue_run.started', NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_queue_run_end
+      AFTER UPDATE OF ended_at ON queue_runs
+      WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
+      BEGIN
+        SELECT codex_resumer_event(
+          'queue_run.ended', NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL
+        );
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_thread_insert
+      AFTER INSERT ON managed_threads
+      BEGIN
+        SELECT codex_resumer_event(
+          'thread.managed', NULL, NEW.id, NULL,
+          NULL, NULL, NULL, NULL
+        );
+      END;
+    `);
   }
 
   #migrateTaskQueue(): void {

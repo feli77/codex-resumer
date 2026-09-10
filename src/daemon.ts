@@ -13,6 +13,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 
 import type { DaemonPaths } from "./paths.js";
 import { readConfiguration, type AccessMode } from "./config.js";
+import { EventLog } from "./event-log.js";
 import type { RunPolicy } from "./run-policy.js";
 import { StateStore, type QueueSnapshot } from "./state-store.js";
 import { serializeOperationalError } from "./structured-error.js";
@@ -214,7 +215,10 @@ export async function startDaemon({
     };
     let store: StateStore;
     try {
-      store = new StateStore(paths.databasePath);
+      store = new StateStore(
+        paths.databasePath,
+        new EventLog(paths.eventLogPath, () => clock.now()),
+      );
     } catch (error) {
       await appServer.close();
       throw error;

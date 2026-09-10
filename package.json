@@ -8,7 +8,8 @@
   },
   "files": [
     "dist/src",
-    "README.md"
+    "README.md",
+    "scripts"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -17,7 +18,9 @@
     "test": "npm run build && node --test 'dist/test/**/*.test.js'",
     "test:cli": "npm run build && node --test dist/test/cli.test.js",
     "test:daemon": "npm run build && node --test dist/test/daemon.test.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:package": "node scripts/verify-package.mjs",
+    "smoke:configured": "node scripts/smoke-configured-access.mjs"
   },
   "engines": {
     "node": ">=20"

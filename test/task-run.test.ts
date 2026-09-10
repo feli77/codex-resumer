@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -267,6 +267,134 @@ test("a Workspace Task runs once and completes without an output marker", async 
   assert.deepEqual(database.prepare("SELECT state FROM queue").get(), {
     state: "running",
   });
+});
+
+test("event logs audit Task state without retaining terminal prompts", async (t) => {
+  const { runCli, stateDir, workspace } = await createCliTestEnvironment(t, {
+    completeTurnSynchronously: true,
+  });
+  const completedPrompt = "private completed prompt 7f6f4b";
+  const cancelledPrompt = "private cancelled prompt 60d024";
+
+  await runCli("daemon", "start");
+  await runCli("task", "add", "--workspace", workspace, completedPrompt);
+  await runCli("queue", "start", "--until-idle");
+  await waitForQueueStatus(runCli, "Task 1: completed");
+  await runCli("task", "add", "--workspace", workspace, cancelledPrompt);
+  await runCli("task", "cancel", "2");
+
+  const logContents = await runCli("logs", "read");
+  const events = logContents.trim().split("\n").map((line) => JSON.parse(line) as {
+    eventType: string;
+    stateTransition?: { from: string | null; to: string };
+    taskId?: number;
+    threadId?: string;
+    timestamp: string;
+    turnId?: string;
+  });
+  assert.ok(events.every((event) => !Number.isNaN(Date.parse(event.timestamp))));
+  assert.deepEqual(
+    events
+      .filter((event) => event.eventType === "task.state_changed")
+      .map((event) => ({
+        stateTransition: event.stateTransition,
+        taskId: event.taskId,
+        threadId: event.threadId,
+        turnId: event.turnId,
+      })),
+    [
+      {
+        stateTransition: { from: null, to: "queued" },
+        taskId: 1,
+        threadId: undefined,
+        turnId: undefined,
+      },
+      {
+        stateTransition: { from: "queued", to: "running" },
+        taskId: 1,
+        threadId: undefined,
+        turnId: undefined,
+      },
+      {
+        stateTransition: { from: "running", to: "completed" },
+        taskId: 1,
+        threadId: "thread-fake",
+        turnId: "turn-fake",
+      },
+      {
+        stateTransition: { from: null, to: "queued" },
+        taskId: 2,
+        threadId: undefined,
+        turnId: undefined,
+      },
+      {
+        stateTransition: { from: "queued", to: "cancelled" },
+        taskId: 2,
+        threadId: undefined,
+        turnId: undefined,
+      },
+    ],
+  );
+  assert.doesNotMatch(logContents, /private completed prompt|private cancelled prompt/);
+
+  const applicationStateDir = path.join(stateDir, "codex-resumer");
+  assert.equal(
+    (await stat(path.join(applicationStateDir, "events.jsonl"))).mode & 0o777,
+    0o600,
+  );
+  assert.equal(
+    (await stat(path.join(applicationStateDir, "state.sqlite3"))).mode & 0o777,
+    0o600,
+  );
+  const database = new Database(path.join(applicationStateDir, "state.sqlite3"), {
+    readonly: true,
+  });
+  t.after(() => database.close());
+  assert.deepEqual(
+    database.prepare("SELECT id, state, prompt FROM tasks ORDER BY id").all(),
+    [
+      { id: 1, state: "completed", prompt: null },
+      { id: 2, state: "cancelled", prompt: null },
+    ],
+  );
+});
+
+test("logs follow streams existing and newly appended events", async (t) => {
+  const { env, root, runCli, stateDir } = await createCliTestEnvironment(t);
+  await runCli("daemon", "start");
+  const child = spawn(process.execPath, [cliPath, "logs", "follow"], {
+    cwd: root,
+    env,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGTERM");
+  });
+
+  const appended = JSON.stringify({
+    eventType: "test.appended",
+    timestamp: "2026-09-10T00:00:00.000Z",
+  });
+  await appendFile(
+    path.join(stateDir, "codex-resumer", "events.jsonl"),
+    `${appended}\n`,
+  );
+  for (let attempt = 0; attempt < 100 && !stdout.includes(appended); attempt += 1) {
+    if (child.exitCode !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  assert.equal(child.exitCode, null, stderr);
+  assert.match(stdout, /"eventType":"queue.state_changed"/);
+  assert.match(stdout, /"eventType":"test.appended"/);
+  child.kill("SIGTERM");
 });
 
 test("a Thread is explicitly imported with its App Server Workspace", async (t) => {
@@ -640,7 +768,10 @@ test("daemon stop --force interrupts the active Turn and pauses before exiting",
 
 test("a non-quota Turn failure pauses the Queue as Needs Attention", async (t) => {
   const { fakeCodex, runCli, workspace } = await createCliTestEnvironment(t, {
-    turnErrors: [{ codexErrorInfo: "unauthorized", message: "login expired" }],
+    turnErrors: [{
+      codexErrorInfo: "unauthorized",
+      message: "login expired; command output SECRET_OUTPUT_7218",
+    }],
   });
 
   await runCli("daemon", "start");
@@ -651,7 +782,14 @@ test("a non-quota Turn failure pauses the Queue as Needs Attention", async (t) =
   const status = await waitForQueueStatus(runCli, "Task 1: needs_attention");
   assert.match(status, /Queue is paused\.[\s\S]*Pause reason: Needs Attention/);
   assert.match(status, /Error turn_failed: login expired/);
-  assert.match(status, /Task 1: needs_attention[\s\S]*Task 2: queued/);
+  assert.match(status, /Task 1: needs_attention \(Needs Attention\)/);
+  assert.match(status, /Next: run `codex-resumer task retry 1/);
+  const events = await runCli("logs", "read");
+  assert.doesNotMatch(events, /SECRET_OUTPUT_7218/);
+  assert.match(
+    events,
+    /"errorSummary":\{"code":"turn_failed","message":"An operational error was recorded/,
+  );
   assert.equal(
     (await readFakeMessages(fakeCodex.logPath))
       .filter((message) => message.method === "turn/start").length,

@@ -18,6 +18,16 @@ for the protocol Codex Resumer checks at startup.
 
 ## Install and run
 
+Install the published npm package globally:
+
+```sh
+npm install --global codex-resumer
+codex-resumer --help
+```
+
+To verify a package built from a source checkout in an isolated temporary
+installation, run `npm run verify:package`.
+
 From a source checkout:
 
 ```sh
@@ -217,5 +227,84 @@ Codex Resumer follows the Linux XDG base-directory convention:
 Application directories are mode `0700`; the Unix domain socket and daemon
 status file are mode `0600`. Queue, Task, Managed Thread, and Turn state is kept
 in `state.sqlite3` inside the state directory. Complete prompts are removed from
-the database when their Task completes. The global configuration exposes only
-`accessMode` and `continuationPrompt`.
+the database when their Task completes or is cancelled. The global
+configuration exposes only `accessMode` and `continuationPrompt`.
+
+The append-only event log is `events.jsonl` in the state directory. Read the
+current log or follow new records with:
+
+```sh
+codex-resumer logs read
+codex-resumer logs follow
+```
+
+Each JSONL record contains a timestamp and event type, plus the relevant Task,
+Thread, Turn, state transition, Quota Pause reset time, or sanitized error code.
+It never records complete Task or Continuation prompts, Codex output,
+environment variables, credentials, or complete command output. Automatic log
+rotation is intentionally not part of the MVP.
+
+Configuration, state, and runtime directories are mode `0700`. Configuration,
+database, daemon status, socket, and event-log files are mode `0600`; the parent
+directories provide the same current-user-only protection to transient SQLite
+files.
+
+## Troubleshooting
+
+- If `daemon status` reports that the daemon is stopped, run
+  `codex-resumer daemon start`.
+- If startup reports an unauthenticated daemon, run `codex login`, confirm with
+  `codex login status`, then start the daemon again.
+- If startup reports missing App Server capabilities, update Codex CLI using
+  the same installation method originally used, check `codex --version`, and
+  run `codex-resumer daemon start` again.
+- If the Queue is in Needs Attention, inspect `codex-resumer queue status` and
+  `codex-resumer logs read`; resolve the named Task with `task retry`,
+  `task complete`, or `task cancel`, then explicitly resume the Queue.
+- If a Task is in Quota Pause, leave the daemon running. It uses the applicable
+  server reset time and rechecks the account before starting a Continuation.
+- A normal stop refuses during an active Turn. Let it finish, or use
+  `codex-resumer daemon stop --force` knowing that the Task will require review.
+
+## Optional login startup
+
+Codex Resumer never installs a login service automatically. On a Linux system
+using systemd user services, first find the absolute executable path with
+`command -v codex-resumer`. Create `~/.config/systemd/user/codex-resumer.service`
+with that path substituted for `/absolute/path/to/codex-resumer`:
+
+```ini
+[Unit]
+Description=Codex Resumer daemon
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/absolute/path/to/codex-resumer daemon start
+ExecStop=/absolute/path/to/codex-resumer daemon stop
+
+[Install]
+WantedBy=default.target
+```
+
+Then opt in and inspect its status:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now codex-resumer.service
+systemctl --user status codex-resumer.service
+```
+
+Disable it with `systemctl --user disable --now codex-resumer.service`.
+
+## Real Configured Access smoke test
+
+The release smoke test uses an isolated XDG data directory, checks the real
+Codex login and App Server capabilities, submits one harmless Task under
+Configured Access, verifies status, and restarts the daemon. It never selects
+Full Access. Because it consumes one real Codex Turn, it requires explicit
+opt-in:
+
+```sh
+CODEX_RESUMER_RUN_REAL_SMOKE=1 npm run smoke:configured
+```

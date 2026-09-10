@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 
@@ -46,6 +47,8 @@ const usage = `Usage:
   codex-resumer queue pause
   codex-resumer queue resume (--until-idle | --cutoff <timestamp>) [--yes]
   codex-resumer queue status
+  codex-resumer logs read
+  codex-resumer logs follow
   codex-resumer config show
   codex-resumer config set accessMode <configured|full>
   codex-resumer config set continuationPrompt <prompt>
@@ -162,6 +165,16 @@ async function main(args: string[]): Promise<number> {
 
   if (args[0] === "queue" && args[1] === "status" && args.length === 2) {
     process.stdout.write(renderQueueStatus(await getQueueStatus(paths)));
+    return 0;
+  }
+
+  if (args[0] === "logs" && args[1] === "read" && args.length === 2) {
+    process.stdout.write(await readEventLog(paths.eventLogPath));
+    return 0;
+  }
+
+  if (args[0] === "logs" && args[1] === "follow" && args.length === 2) {
+    await followEventLog(paths.eventLogPath);
     return 0;
   }
 
@@ -300,13 +313,16 @@ function installShutdownHandlers(daemon: RunningDaemon): void {
 function renderStatus(status: DaemonStatus): string {
   switch (status.state) {
     case "running":
-      return `Daemon is running (PID ${status.pid}, ${status.codexVersion}).`;
+      return `Daemon is running (PID ${status.pid}, ${status.codexVersion}).\n`
+        + "Next: run `codex-resumer queue status`.";
     case "stopped":
-      return "Daemon is stopped.";
+      return "Daemon is stopped.\nNext: run `codex-resumer daemon start`.";
     case "unauthenticated":
-      return `Daemon is unauthenticated: ${status.message} Codex: ${status.codexVersion}.`;
+      return `Daemon is unauthenticated: ${status.message} Codex: ${status.codexVersion}.\n`
+        + "Next: run `codex login`, then `codex-resumer daemon start`.";
     case "incompatible":
-      return `Daemon is incompatible: ${status.message} Missing: ${status.missingCapabilities.join(", ")}. Codex: ${status.codexVersion}.`;
+      return `Daemon is incompatible: ${status.message} Missing: ${status.missingCapabilities.join(", ")}. Codex: ${status.codexVersion}.\n`
+        + "Next: update Codex CLI, then run `codex-resumer daemon start`.";
   }
 }
 
@@ -339,7 +355,7 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
     }
   }
   for (const task of snapshot.tasks) {
-    lines.push(`Task ${task.id}: ${task.state}`);
+    lines.push(`Task ${task.id}: ${task.state} (${renderTaskState(task.state)})`);
     lines.push(`  Workspace ${task.workspace}`);
     lines.push(
       `  Thread ${task.managedThreadId ?? "new"}, Turn ${task.activeTurnId ?? "pending"}`,
@@ -352,7 +368,40 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
       );
     }
   }
+  const attentionTask = snapshot.tasks.find((task) => task.state === "needs_attention");
+  if (attentionTask) {
+    lines.push(
+      `Next: run \`codex-resumer task retry ${attentionTask.id} "<new prompt>"\`, `
+      + `\`codex-resumer task complete ${attentionTask.id}\`, or `
+      + `\`codex-resumer task cancel ${attentionTask.id}\`; then resume the Queue.`,
+    );
+  } else if (snapshot.state === "paused") {
+    lines.push("Next: run `codex-resumer queue resume --until-idle` when ready.");
+  } else if (snapshot.state === "idle") {
+    lines.push(
+      "Next: add a Task with `codex-resumer task add`, then start the Queue.",
+    );
+  } else {
+    lines.push("Next: run `codex-resumer queue pause` to stop starting new Turns.");
+  }
   return `${lines.join("\n")}\n`;
+}
+
+function renderTaskState(state: QueueSnapshot["tasks"][number]["state"]): string {
+  switch (state) {
+    case "queued":
+      return "Queued Task";
+    case "running":
+      return "Running Task";
+    case "waiting_for_quota":
+      return "Quota Pause";
+    case "needs_attention":
+      return "Needs Attention";
+    case "completed":
+      return "Completed Task";
+    case "cancelled":
+      return "Cancelled Task";
+  }
 }
 
 function renderAccessMode(accessMode: AccessMode): string {
@@ -376,6 +425,39 @@ function renderPauseReason(reason: NonNullable<QueueSnapshot["pauseReason"]>): s
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function readEventLog(eventLogPath: string): Promise<string> {
+  try {
+    return await readFile(eventLogPath, "utf8");
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return "";
+    throw error;
+  }
+}
+
+async function followEventLog(eventLogPath: string): Promise<void> {
+  let offset = 0;
+  let stopped = false;
+  const stop = (): void => {
+    stopped = true;
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    while (!stopped) {
+      const contents = await readEventLog(eventLogPath);
+      if (contents.length < offset) offset = 0;
+      if (contents.length > offset) {
+        process.stdout.write(contents.slice(offset));
+        offset = contents.length;
+      }
+      if (!stopped) await delay(100);
+    }
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
 }
 
 async function readStdin(): Promise<string> {
@@ -416,6 +498,10 @@ function parseTaskAdd(args: string[]): {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function parseTaskId(value: string | undefined): number {
@@ -491,6 +577,12 @@ void main(process.argv.slice(2))
     process.exitCode = exitCode;
   })
   .catch((error: unknown) => {
-    process.stderr.write(`${errorMessage(error)}\n`);
+    process.stderr.write(`${renderCliError(error)}\n`);
     process.exitCode = 1;
   });
+
+function renderCliError(error: unknown): string {
+  const message = errorMessage(error);
+  if (message.includes("`") || /rerun with --yes/i.test(message)) return message;
+  return `${message}\nNext: run \`codex-resumer --help\` to review the command syntax.`;
+}

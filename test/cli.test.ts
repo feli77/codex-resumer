@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -56,6 +56,7 @@ test("queue start requires an explicit Run Policy with a zoned Cutoff Time", asy
     (error: unknown) => {
       assert.ok(error instanceof Error && "stderr" in error);
       assert.match(String(error.stderr), /requires --until-idle or --cutoff/);
+      assert.match(String(error.stderr), /Next: run `codex-resumer --help`/);
       return true;
     },
   );
@@ -74,6 +75,28 @@ test("queue start requires an explicit Run Policy with a zoned Cutoff Time", asy
       assert.match(String(error.stderr), /queue resume requires --until-idle or --cutoff/);
       return true;
     },
+  );
+});
+
+test("status output gives an executable next step", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "codex-resumer-status-next-test-"));
+  const env = {
+    ...process.env,
+    HOME: root,
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    XDG_RUNTIME_DIR: path.join(root, "runtime"),
+    XDG_STATE_HOME: path.join(root, "state"),
+  };
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [cliPath, "daemon", "status"],
+    { encoding: "utf8", env },
+  );
+  assert.match(
+    stdout,
+    /Daemon is stopped\.\nNext: run `codex-resumer daemon start`\./,
   );
 });
 
@@ -106,4 +129,9 @@ test("global configuration exposes Access Mode and the Continuation prompt", asy
     "Access Mode updated to Full Access.\n",
   );
   assert.match(await runCli("config", "show"), /^Access Mode: Full Access\n/);
+  assert.equal(
+    (await stat(path.join(root, "config", "codex-resumer", "config.json"))).mode
+      & 0o777,
+    0o600,
+  );
 });

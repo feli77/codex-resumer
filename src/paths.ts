@@ -7,6 +7,7 @@ export interface DaemonPaths {
   configDir: string;
   configPath: string;
   databasePath: string;
+  eventLogPath: string;
   lockPath: string;
   runtimeDir: string;
   socketPath: string;
@@ -32,6 +33,7 @@ export function resolvePaths(
     configDir: path.join(configBase, APP_DIRECTORY),
     configPath: path.join(configBase, APP_DIRECTORY, "config.json"),
     databasePath: path.join(stateBase, APP_DIRECTORY, "state.sqlite3"),
+    eventLogPath: path.join(stateBase, APP_DIRECTORY, "events.jsonl"),
     lockPath: path.join(runtimeDir, "daemon-start.lock"),
     runtimeDir,
     socketPath: path.join(runtimeDir, "daemon.sock"),
