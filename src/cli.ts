@@ -360,6 +360,7 @@ function renderQueueStatus(snapshot: QueueSnapshot): string {
     lines.push(
       `  Thread ${task.managedThreadId ?? "new"}, Turn ${task.activeTurnId ?? "pending"}`,
     );
+    lines.push(`  Thread state ${task.managedThreadState ?? "not created"}`);
     if (task.state === "waiting_for_quota") {
       lines.push(
         `  Quota ${task.quotaLimitId ?? "unknown"}`

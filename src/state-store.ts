@@ -33,6 +33,7 @@ export interface TaskSummary {
   activeTurnId: string | undefined;
   id: number;
   managedThreadId: string | undefined;
+  managedThreadState: "active" | "idle" | undefined;
   quotaLimitId?: string;
   quotaLimitType?: string;
   quotaResetAt?: string;
@@ -105,6 +106,7 @@ interface TaskRow {
   active_turn_id: string | null;
   id: number;
   managed_thread_id: string | null;
+  managed_thread_state: "active" | "idle" | null;
   prompt: string | null;
   quota_limit_id: string | null;
   quota_limit_type: string | null;
@@ -571,15 +573,21 @@ export class StateStore {
     managedThreadId: string,
     turnId: string,
     now: Date,
-  ): void {
-    this.#database.transaction(() => {
+  ): boolean {
+    return this.#database.transaction(() => {
+      const task = this.#database.prepare(`
+        SELECT id FROM tasks
+        WHERE id = ? AND managed_thread_id = ? AND state = 'running'
+      `).get(taskId, managedThreadId);
+      if (!task) return false;
       this.#database.prepare(`
         INSERT INTO turns (id, task_id, managed_thread_id, state, started_at)
         VALUES (?, ?, ?, 'in_progress', ?)
       `).run(turnId, taskId, managedThreadId, now.toISOString());
       this.#database.prepare(`
-        UPDATE tasks SET active_turn_id = ? WHERE id = ? AND state = 'running'
+        UPDATE tasks SET active_turn_id = ? WHERE id = ?
       `).run(turnId, taskId);
+      return true;
     })();
   }
 
@@ -1043,9 +1051,13 @@ export class StateStore {
     };
     const queueRun = this.#latestQueueRun();
     const tasks = this.#database.prepare(`
-      SELECT id, workspace, state, managed_thread_id, active_turn_id, prompt,
-             quota_limit_id, quota_limit_type, quota_reset_at
-      FROM tasks ORDER BY queue_position, id
+      SELECT tasks.id, tasks.workspace, tasks.state, tasks.managed_thread_id,
+             tasks.active_turn_id, tasks.prompt, tasks.quota_limit_id,
+             tasks.quota_limit_type, tasks.quota_reset_at,
+             managed_threads.state AS managed_thread_state
+      FROM tasks
+      LEFT JOIN managed_threads ON managed_threads.id = tasks.managed_thread_id
+      ORDER BY tasks.queue_position, tasks.id
     `).all() as TaskRow[];
     const hasUnfinishedTask = tasks.some(
       (task) =>
@@ -1090,6 +1102,7 @@ export class StateStore {
         workspace: task.workspace,
         state: task.state,
         managedThreadId: task.managed_thread_id ?? undefined,
+        managedThreadState: task.managed_thread_state ?? undefined,
         activeTurnId: task.active_turn_id ?? undefined,
         ...(task.quota_limit_id === null ? {} : { quotaLimitId: task.quota_limit_id }),
         ...(task.quota_limit_type === null

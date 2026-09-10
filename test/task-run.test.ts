@@ -195,6 +195,7 @@ test("a Workspace Task runs once and completes without an output marker", async 
   assert.match(status, /Queue Run 1: Until Idle/);
   assert.match(status, /Task 1: completed/);
   assert.match(status, /Thread thread-fake, Turn turn-fake/);
+  assert.match(status, /Thread state idle/);
   assert.doesNotMatch(status, /Create a note/);
   assert.match(
     status,
@@ -570,6 +571,7 @@ test("queued Tasks can be added, moved, and cancelled while a Task is active", a
     /Task 1: running[\s\S]*Task 4: queued[\s\S]*Task 2: queued[\s\S]*Task 3: cancelled/,
   );
   assert.match(list, /Task 1: running[\s\S]*Thread thread-fake, Turn turn-fake/);
+  assert.match(list, /Task 1: running[\s\S]*Thread state active/);
   assert.doesNotMatch(list, /Active secret|Second secret|Cancel secret|Move secret/);
 
   const database = new Database(

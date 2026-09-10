@@ -770,6 +770,11 @@ function isQueueSnapshot(value: unknown): value is QueueSnapshot {
       || task.state === "cancelled"
     )
     && (task.managedThreadId === undefined || typeof task.managedThreadId === "string")
+    && (
+      task.managedThreadState === undefined
+      || task.managedThreadState === "active"
+      || task.managedThreadState === "idle"
+    )
     && (task.activeTurnId === undefined || typeof task.activeTurnId === "string")
     && (task.quotaLimitId === undefined || typeof task.quotaLimitId === "string")
     && (task.quotaLimitType === undefined || typeof task.quotaLimitType === "string")

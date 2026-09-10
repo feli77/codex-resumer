@@ -167,8 +167,8 @@ prompt; the stored old prompt is never reused. `task complete` records manual
 completion. Every manual resolution leaves the Queue paused until an explicit
 resume. External activity on a Managed Thread also pauses the Queue for review
 without interrupting a Turn that Codex Resumer already owns. `task list` and
-`queue status` show Queue order, state, Workspace, Thread, and Turn identifiers
-without displaying prompts.
+`queue status` show Queue order, Task and Thread states, Workspace, and
+Thread/Turn identifiers without displaying prompts.
 
 Workspace paths are stored as canonical absolute paths. A successful Codex Turn
 completes the Task and starts the next queued Task; no marker is required in the

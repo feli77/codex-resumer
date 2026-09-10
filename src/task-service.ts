@@ -462,10 +462,12 @@ export class TaskService {
       threadId,
       task.prompt,
       task.workspace,
-      (turnId) => {
-        this.store.recordTurnStarted(task.id, threadId, turnId, this.clock.now());
-        return true;
-      },
+      (turnId) => this.store.recordTurnStarted(
+        task.id,
+        threadId,
+        turnId,
+        this.clock.now(),
+      ),
     );
     return true;
   }
@@ -511,7 +513,11 @@ export class TaskService {
       );
       const acceptedTurn = { threadId, turnId };
       this.#unrecordedAcceptedTurns.push(acceptedTurn);
-      if (!recordStarted(turnId)) return;
+      if (!recordStarted(turnId)) {
+        await this.appServer.interruptTurn(threadId, turnId);
+        this.#discardAcceptedTurn(acceptedTurn);
+        return;
+      }
       this.#unrecordedAcceptedTurns = this.#unrecordedAcceptedTurns.filter(
         (candidate) => candidate !== acceptedTurn,
       );
@@ -519,6 +525,28 @@ export class TaskService {
     } finally {
       this.#turnStartsInProgress.delete(threadId);
     }
+  }
+
+  #discardAcceptedTurn(turn: StartedTurn): void {
+    this.#unrecordedAcceptedTurns = this.#unrecordedAcceptedTurns.filter(
+      (candidate) => candidate !== turn,
+    );
+    this.#startedBeforeTurnRecorded = this.#startedBeforeTurnRecorded.filter(
+      (candidate) =>
+        candidate.threadId !== turn.threadId || candidate.turnId !== turn.turnId,
+    );
+    if (
+      this.#completionBeforeTurnStart?.threadId === turn.threadId
+      && this.#completionBeforeTurnStart.turnId === turn.turnId
+    ) this.#completionBeforeTurnStart = undefined;
+    if (
+      this.#quotaBeforeTurnStart?.threadId === turn.threadId
+      && this.#quotaBeforeTurnStart.turnId === turn.turnId
+    ) this.#quotaBeforeTurnStart = undefined;
+    if (
+      this.#unattendedBeforeTurnStart?.threadId === turn.threadId
+      && this.#unattendedBeforeTurnStart.turnId === turn.turnId
+    ) this.#unattendedBeforeTurnStart = undefined;
   }
 
   #reconcileTurnStart(threadId: string, turnId: string): void {

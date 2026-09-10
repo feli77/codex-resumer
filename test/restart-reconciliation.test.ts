@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 
 import {
   addWorkspaceTask,
+  cancelTask,
   getQueueStatus,
   pauseQueue,
   startDaemon,
@@ -439,6 +440,30 @@ test("forced stop interrupts a Turn accepted while stop is waiting", async (t) =
   const snapshot = await getQueueStatus(paths);
   assert.equal(snapshot.state, "paused");
   assert.equal(snapshot.tasks[0]?.state, "needs_attention");
+});
+
+test("cancelling during turn/start interrupts the accepted Turn", async (t) => {
+  const { appServer, paths, releaseTurnStart, starting } =
+    await createInFlightTurnEnvironment(t);
+
+  await cancelTask(paths, 1);
+  assert.equal((await getQueueStatus(paths)).tasks[0]?.state, "cancelled");
+
+  releaseTurnStart();
+  await starting;
+
+  assert.deepEqual(appServer.interruptedTurns, [{
+    threadId: "thread-recovery",
+    turnId: "turn-1",
+  }]);
+  const database = new Database(paths.databasePath, { readonly: true });
+  t.after(() => database.close());
+  assert.equal(
+    (database.prepare(
+      "SELECT COUNT(*) AS count FROM turns WHERE state = 'in_progress'",
+    ).get() as { count: number }).count,
+    0,
+  );
 });
 
 test("normal stop completes after an in-flight Turn start fails", async (t) => {

@@ -498,6 +498,7 @@ test("a structured quota pause waits for the matching reset before continuing in
     activeTurnId: "turn-1",
     id: 1,
     managedThreadId: "thread-quota",
+    managedThreadState: "active",
     quotaLimitId: "codex",
     quotaLimitType: "rate_limit_reached",
     quotaResetAt: "2026-09-04T10:05:00.000Z",
