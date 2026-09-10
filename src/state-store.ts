@@ -1192,20 +1192,24 @@ export class StateStore {
         OR OLD.pause_reason IS NOT NEW.pause_reason
         OR OLD.error_code IS NOT NEW.error_code
       BEGIN
-        SELECT codex_resumer_event(json_object(
-          'eventType', 'queue.state_changed',
-          'taskId', (SELECT id FROM tasks
+        SELECT codex_resumer_event(json_patch(
+          json_object(
+            'eventType', 'queue.state_changed',
+            'fromState', OLD.state,
+            'toState', NEW.state,
+            'errorCode', NEW.error_code
+          ),
+          COALESCE((
+            SELECT json_object(
+              'taskId', id,
+              'threadId', managed_thread_id,
+              'turnId', active_turn_id
+            )
+            FROM tasks
             WHERE state IN ('needs_attention', 'running', 'waiting_for_quota')
-            ORDER BY state = 'needs_attention' DESC, queue_position, id LIMIT 1),
-          'threadId', (SELECT managed_thread_id FROM tasks
-            WHERE state IN ('needs_attention', 'running', 'waiting_for_quota')
-            ORDER BY state = 'needs_attention' DESC, queue_position, id LIMIT 1),
-          'turnId', (SELECT active_turn_id FROM tasks
-            WHERE state IN ('needs_attention', 'running', 'waiting_for_quota')
-            ORDER BY state = 'needs_attention' DESC, queue_position, id LIMIT 1),
-          'fromState', OLD.state,
-          'toState', NEW.state,
-          'errorCode', NEW.error_code
+            ORDER BY state = 'needs_attention' DESC, queue_position, id
+            LIMIT 1
+          ), '{}')
         ));
       END;
 
