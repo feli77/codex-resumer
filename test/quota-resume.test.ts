@@ -1042,6 +1042,19 @@ test("polling discovers a reached bucket after the initial rate-limit read fails
   clock.advanceTo("2026-09-04T10:01:00.000Z");
   const identified = await waitForQuotaLimit(paths, "codex");
   assert.equal(identified.tasks[0]?.quotaResetAt, "2026-09-04T10:05:00.000Z");
+  const learnedReset = (await readFile(paths.eventLogPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((event) => event.eventType === "quota.reset_updated");
+  assert.deepEqual(learnedReset, {
+    eventType: "quota.reset_updated",
+    quotaResetAt: "2026-09-04T10:05:00.000Z",
+    taskId: 1,
+    threadId: "thread-quota",
+    timestamp: "2026-09-04T10:01:00.000Z",
+    turnId: "turn-1",
+  });
   clock.advanceTo("2026-09-04T10:05:02.000Z");
   await waitForTurnCount(appServer, 2);
   assert.equal(appServer.turns[1]?.threadId, "thread-quota");

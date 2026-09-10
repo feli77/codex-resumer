@@ -724,7 +724,7 @@ test("normal daemon stop refuses while a Turn is active", async (t) => {
     (error: unknown) => {
       assert.ok(error instanceof Error && "stderr" in error);
       assert.match(String(error.stderr), /active Turn is still running/i);
-      assert.match(String(error.stderr), /daemon stop --force/i);
+      assert.match(String(error.stderr), /`codex-resumer daemon stop --force`/i);
       return true;
     },
   );
@@ -1014,6 +1014,26 @@ test("external Managed Thread activity pauses without interrupting the owned Tur
   assert.equal(
     messages.filter((message) => message.method === "turn/start").length,
     1,
+  );
+  const externalActivity = (await runCli("logs", "read"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((event) => event.eventType === "thread.external_activity");
+  assert.deepEqual(
+    {
+      errorSummary: externalActivity?.errorSummary,
+      threadId: externalActivity?.threadId,
+      turnId: externalActivity?.turnId,
+    },
+    {
+      errorSummary: {
+        code: "external_thread_activity",
+        message: "An operational error was recorded; inspect Queue status for details.",
+      },
+      threadId: "thread-fake",
+      turnId: "turn-external",
+    },
   );
 });
 

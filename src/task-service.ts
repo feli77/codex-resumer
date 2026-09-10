@@ -269,7 +269,7 @@ export class TaskService {
       )
     ) {
       throw new Error(
-        "An active Turn is still running. Let it finish or use `daemon stop --force` to interrupt it.",
+        "An active Turn is still running. Let it finish or use `codex-resumer daemon stop --force` to interrupt it.",
       );
     }
     if (force) {

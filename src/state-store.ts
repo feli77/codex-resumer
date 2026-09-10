@@ -3,7 +3,7 @@ import { chmodSync } from "node:fs";
 import Database from "better-sqlite3";
 
 import type { AccessMode } from "./config.js";
-import { EventLog, sanitizedErrorSummary } from "./event-log.js";
+import { EventLog } from "./event-log.js";
 import type { RunPolicy } from "./run-policy.js";
 import type { StructuredError } from "./structured-error.js";
 
@@ -176,31 +176,8 @@ export class StateStore {
     chmodSync(databasePath, 0o600);
     this.#database.function(
       "codex_resumer_event",
-      (
-        eventType: string,
-        taskId: number | null,
-        threadId: string | null,
-        turnId: string | null,
-        fromState: string | null,
-        toState: string | null,
-        quotaResetAt: string | null,
-        errorCode: string | null,
-      ) => {
-        if (eventLog) {
-          eventLog.record({
-            eventType,
-            ...(taskId === null ? {} : { taskId }),
-            ...(threadId === null ? {} : { threadId }),
-            ...(turnId === null ? {} : { turnId }),
-            ...(toState === null
-              ? {}
-              : { stateTransition: { from: fromState, to: toState } }),
-            ...(quotaResetAt === null ? {} : { quotaResetAt }),
-            ...(errorCode === null
-              ? {}
-              : { errorSummary: sanitizedErrorSummary(errorCode) }),
-          });
-        }
+      (payload: string) => {
+        eventLog?.recordDatabaseEvent(payload);
         return 0;
       },
     );
@@ -1008,6 +985,14 @@ export class StateStore {
           message: "External activity was detected on a Managed Thread.",
         },
       );
+      this.#database.prepare(`
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'thread.external_activity',
+          'threadId', ?,
+          'turnId', ?,
+          'errorCode', 'external_thread_activity'
+        ))
+      `).get(managedThreadId, turnId);
       return true;
     })();
   }
@@ -1118,48 +1103,81 @@ export class StateStore {
       CREATE TRIGGER IF NOT EXISTS event_log_task_insert
       AFTER INSERT ON tasks
       BEGIN
-        SELECT codex_resumer_event(
-          'task.state_changed', NEW.id, NEW.managed_thread_id,
-          NEW.active_turn_id, NULL, NEW.state, NEW.quota_reset_at, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'task.state_changed',
+          'taskId', NEW.id,
+          'threadId', NEW.managed_thread_id,
+          'turnId', NEW.active_turn_id,
+          'fromState', NULL,
+          'toState', NEW.state,
+          'quotaResetAt', NEW.quota_reset_at
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_task_state
       AFTER UPDATE OF state ON tasks
       WHEN OLD.state IS NOT NEW.state
       BEGIN
-        SELECT codex_resumer_event(
-          'task.state_changed', NEW.id, NEW.managed_thread_id,
-          NEW.active_turn_id, OLD.state, NEW.state, NEW.quota_reset_at, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'task.state_changed',
+          'taskId', NEW.id,
+          'threadId', NEW.managed_thread_id,
+          'turnId', NEW.active_turn_id,
+          'fromState', OLD.state,
+          'toState', NEW.state,
+          'quotaResetAt', NEW.quota_reset_at
+        ));
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS event_log_quota_reset
+      AFTER UPDATE OF quota_reset_at ON tasks
+      WHEN OLD.quota_reset_at IS NOT NEW.quota_reset_at
+      BEGIN
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'quota.reset_updated',
+          'taskId', NEW.id,
+          'threadId', NEW.managed_thread_id,
+          'turnId', NEW.active_turn_id,
+          'quotaResetAt', NEW.quota_reset_at
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_turn_insert
       AFTER INSERT ON turns
       BEGIN
-        SELECT codex_resumer_event(
-          'turn.state_changed', NEW.task_id, NEW.managed_thread_id,
-          NEW.id, NULL, NEW.state, NULL, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'turn.state_changed',
+          'taskId', NEW.task_id,
+          'threadId', NEW.managed_thread_id,
+          'turnId', NEW.id,
+          'fromState', NULL,
+          'toState', NEW.state
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_turn_state
       AFTER UPDATE OF state ON turns
       WHEN OLD.state IS NOT NEW.state
       BEGIN
-        SELECT codex_resumer_event(
-          'turn.state_changed', NEW.task_id, NEW.managed_thread_id,
-          NEW.id, OLD.state, NEW.state, NULL, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'turn.state_changed',
+          'taskId', NEW.task_id,
+          'threadId', NEW.managed_thread_id,
+          'turnId', NEW.id,
+          'fromState', OLD.state,
+          'toState', NEW.state
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_queue_insert
       AFTER INSERT ON queue
       BEGIN
-        SELECT codex_resumer_event(
-          'queue.state_changed', NULL, NULL, NULL,
-          NULL, NEW.state, NULL, NEW.error_code
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'queue.state_changed',
+          'fromState', NULL,
+          'toState', NEW.state,
+          'errorCode', NEW.error_code
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_queue_update
@@ -1168,44 +1186,44 @@ export class StateStore {
         OR OLD.pause_reason IS NOT NEW.pause_reason
         OR OLD.error_code IS NOT NEW.error_code
       BEGIN
-        SELECT codex_resumer_event(
-          'queue.state_changed',
-          (SELECT id FROM tasks WHERE state = 'needs_attention'
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'queue.state_changed',
+          'taskId', (SELECT id FROM tasks WHERE state = 'needs_attention'
             ORDER BY queue_position, id LIMIT 1),
-          (SELECT managed_thread_id FROM tasks WHERE state = 'needs_attention'
+          'threadId', (SELECT managed_thread_id FROM tasks WHERE state = 'needs_attention'
             ORDER BY queue_position, id LIMIT 1),
-          (SELECT active_turn_id FROM tasks WHERE state = 'needs_attention'
+          'turnId', (SELECT active_turn_id FROM tasks WHERE state = 'needs_attention'
             ORDER BY queue_position, id LIMIT 1),
-          OLD.state, NEW.state, NULL, NEW.error_code
-        );
+          'fromState', OLD.state,
+          'toState', NEW.state,
+          'errorCode', NEW.error_code
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_queue_run_insert
       AFTER INSERT ON queue_runs
       BEGIN
-        SELECT codex_resumer_event(
-          'queue_run.started', NULL, NULL, NULL,
-          NULL, NULL, NULL, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'queue_run.started'
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_queue_run_end
       AFTER UPDATE OF ended_at ON queue_runs
       WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
       BEGIN
-        SELECT codex_resumer_event(
-          'queue_run.ended', NULL, NULL, NULL,
-          NULL, NULL, NULL, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'queue_run.ended'
+        ));
       END;
 
       CREATE TRIGGER IF NOT EXISTS event_log_thread_insert
       AFTER INSERT ON managed_threads
       BEGIN
-        SELECT codex_resumer_event(
-          'thread.managed', NULL, NEW.id, NULL,
-          NULL, NULL, NULL, NULL
-        );
+        SELECT codex_resumer_event(json_object(
+          'eventType', 'thread.managed',
+          'threadId', NEW.id
+        ));
       END;
     `);
   }
